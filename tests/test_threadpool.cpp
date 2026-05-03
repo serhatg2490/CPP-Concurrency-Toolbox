@@ -5,6 +5,7 @@
 #include <chrono>
 #include <numeric>
 #include <atomic>
+#include <cmath>
 
 // --- Helper Functions and Classes ---
 
@@ -198,4 +199,45 @@ TEST(ThreadPoolTest, AtomicIncrementConcurrency) {
 
     int expected_total = num_tasks * increments_per_task;
     EXPECT_EQ(shared_counter.load(), expected_total);
+}
+
+// CPU intensive test to visualize load in Task Manager
+TEST(ThreadPoolTest, HeavyCPULoadTest) {
+    ThreadPool pool; // Uses std::thread::hardware_concurrency()
+    
+    // Launch one heavy task per logical core
+    const int num_tasks = std::thread::hardware_concurrency();
+    std::vector<std::future<void>> futures;
+    futures.reserve(num_tasks);
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < num_tasks; ++i) {
+        futures.push_back(pool.enqueue([]() {
+            auto task_start = std::chrono::high_resolution_clock::now();
+            volatile double result = 0.0;
+            // Keep the CPU thread spinning at 100% for exactly 5 seconds
+            while (true) {
+                for (int j = 0; j < 10000; ++j) {
+                    result += std::sqrt(static_cast<double>(j));
+                }
+                auto now = std::chrono::high_resolution_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - task_start).count() >= 5) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    // Wait for all heavy tasks to finish
+    for (auto& f : futures) {
+        f.get();
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end_time - start_time;
+
+    std::cout << "Heavy load test completed in " << duration.count() << " seconds.\n";
+    // Ensure it ran for at least 5 seconds
+    EXPECT_GE(duration.count(), 5.0); 
 }
