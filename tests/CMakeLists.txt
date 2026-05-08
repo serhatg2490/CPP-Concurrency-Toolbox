@@ -9,10 +9,11 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 add_executable(threadpool_tests test_threadpool.cpp)
-
-# Link the executable against the ThreadPool interface and GTest
 target_link_libraries(threadpool_tests PRIVATE ThreadPool GTest::gtest_main)
 
-# Add the test to CTest
+add_executable(spsc_queue_tests test_spsc_queue.cpp)
+target_link_libraries(spsc_queue_tests PRIVATE ThreadPool GTest::gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(threadpool_tests)
+gtest_discover_tests(spsc_queue_tests)
