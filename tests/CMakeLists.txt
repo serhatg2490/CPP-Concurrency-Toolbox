@@ -14,6 +14,10 @@ target_link_libraries(threadpool_tests PRIVATE ThreadPool GTest::gtest_main)
 add_executable(spsc_queue_tests test_spsc_queue.cpp)
 target_link_libraries(spsc_queue_tests PRIVATE ThreadPool GTest::gtest_main)
 
+add_executable(spmc_queue_tests test_spmc_queue.cpp)
+target_link_libraries(spmc_queue_tests PRIVATE ThreadPool GTest::gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(threadpool_tests)
 gtest_discover_tests(spsc_queue_tests)
+gtest_discover_tests(spmc_queue_tests)

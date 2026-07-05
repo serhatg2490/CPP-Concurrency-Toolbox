@@ -12,7 +12,7 @@
 
 
 /**
- * Modern C++23 SPSC Queue
+ * Modern C++20 SPSC Queue
  * - Type safety via C++20 Concepts
  * - Cache-line alignment to prevent false sharing
  * - Power-of-two masking for fast index wrapping (no modulo)
