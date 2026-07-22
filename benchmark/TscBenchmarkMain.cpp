@@ -68,12 +68,15 @@ static void teardown_process() {}
 #endif
 
 // ── Core assignment constants — Intel Core Ultra 5 125H ──────────────────────
-// P-core HT pairs: (0,1) (2,3) (4,5) (6,7); E-cores: 8-15 (no HT)
-// Core 0: primary OS interrupt / DPC target — idle main pinned here to absorb noise
-static constexpr int MAIN_CORE  = 0;   // P-core 0, HT-A — idle; absorbs OS interrupts
-static constexpr int PROD_CORE  = 2;   // P-core 1, HT-A — shielded from interrupts
-static constexpr int CONS0_CORE = 4;   // P-core 2, HT-A
-static constexpr int CONS_STEP  = 2;   // skip HT siblings: 1C->{4}  2C->{4,6}  4C->{4,6,8,10}
+// Real HT pairs (from `lscpu --extended`, core_id column): (0,5) (1,2) (3,4) (6,7)
+// E-cores: 8-15 (no HT). See BenchmarkMain.cpp for the full derivation.
+//
+// Main is idle for the whole measured run (blocked in join()), so it shares
+// P-core 0 with the producer instead of consuming a full dedicated P-core.
+static constexpr int MAIN_CORE = 0;   // P-core 0, HT-A — idle; absorbs OS interrupts
+static constexpr int PROD_CORE = 5;   // P-core 0, HT-B — shares main's core (main is idle, not spinning)
+static constexpr int CONSUMER_CORES[] = { 1, 3, 6, 8 }; // P-core 1, P-core 2, P-core 3, E-core 0
+// Result: 1C->{1}  2C->{1,3}  4C->{1,3,6,8}  (8 = E-core; only 4 P-cores exist total)
 
 // ── TSC-based clock ───────────────────────────────────────────────────────────
 static std::int64_t produce_ts() noexcept {
@@ -97,8 +100,7 @@ void run_benchmark(const char*  label,
                    std::size_t  capacity,
                    std::int64_t rate_limit_ns   = 0,
                    int          producer_core   = PROD_CORE,
-                   int          consumer0_core  = CONS0_CORE,
-                   int          consumer_stride = CONS_STEP)
+                   const int*   consumer_cores  = CONSUMER_CORES)
 {
     const std::size_t total = warmup + measure;
     Queue q(capacity);
@@ -111,8 +113,8 @@ void run_benchmark(const char*  label,
     std::vector<std::thread> cthr;
     cthr.reserve(n_consumers);
     for (std::size_t ci = 0; ci < n_consumers; ++ci) {
-        cthr.emplace_back([&, ci, warmup, consumer0_core, consumer_stride]() {
-            pin_thread(consumer0_core >= 0 ? consumer0_core + (int)ci * consumer_stride : -1);
+        cthr.emplace_back([&, ci, warmup, consumer_cores]() {
+            pin_thread(consumer_cores ? consumer_cores[ci] : -1);
             elevate_thread();
             while (!go.load(std::memory_order_acquire)) {}
 
@@ -169,10 +171,12 @@ int main() {
     setup_process(MAIN_CORE);
 
     std::printf("  TSC calibration : %.3f GHz\n", tsc::g_tsc_hz / 1e9);
-    std::printf("  Core assignment : main=%d  producer=%d  consumer_base=%d  stride=%d\n",
-                MAIN_CORE, PROD_CORE, CONS0_CORE, CONS_STEP);
-    std::printf("  Topology        : P{0,1}=core0  P{2,3}=core1  P{4,5}=core2  P{6,7}=core3  E:{8-15}\n");
-    std::printf("  NOTE            : core 0 absorbs OS interrupts (idle main); producer shielded on core 2\n");
+    std::printf("  Core assignment : main=%d  producer=%d  consumers=%d,%d,%d,%d\n",
+                MAIN_CORE, PROD_CORE,
+                CONSUMER_CORES[0], CONSUMER_CORES[1], CONSUMER_CORES[2], CONSUMER_CORES[3]);
+    std::printf("  Topology        : P{0,5}=core0  P{1,2}=core1  P{3,4}=core2  P{6,7}=core3  E:{8-15}\n");
+    std::printf("  NOTE            : main+producer share core0 (main idle, blocked in join); 4th consumer (%d) is an E-core\n",
+                CONSUMER_CORES[3]);
 #ifdef _WIN32
     std::printf("  Priority        : HIGH_PRIORITY_CLASS + THREAD_PRIORITY_HIGHEST\n");
     std::printf("  Timer           : timeBeginPeriod(1) -> 1 ms granularity\n");

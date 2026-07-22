@@ -25,25 +25,34 @@
 //
 //  Core assignment — Intel Core Ultra 5 125H (Meteor Lake, hybrid):
 //
-//    Physical -> logical mapping:
-//      P-core 0 : logical  0 and  1   (HT pair, ~3 GHz, fastest)
-//      P-core 1 : logical  2 and  3   (HT pair)
-//      P-core 2 : logical  4 and  5   (HT pair)
+//    Physical -> logical mapping (verified via `lscpu --extended`; the HT
+//    pairs are NOT sequential (0,1)(2,3)... on this chip — core_id groups
+//    logical CPUs irregularly):
+//      P-core 0 : logical  0 and  5   (HT pair)
+//      P-core 1 : logical  1 and  2   (HT pair)
+//      P-core 2 : logical  3 and  4   (HT pair)
 //      P-core 3 : logical  6 and  7   (HT pair)
-//      E-core 0 : logical  8          (no HT, ~2x slower, low power)
-//      E-core 1-7: logical 9-15       (same)
+//      E-core 0-7: logical  8-15      (no HT, ~2x slower, low power)
 //      LP-E 0-1 : logical 16-17       (very low power, unsuitable for latency)
 //
-//    Benchmark assignment (CONS_STEP=2 -> different physical P-cores):
-//      main=0   : P-core 0, HT-A — idle during benchmark; absorbs OS interrupts
-//      producer=2: P-core 1, HT-A — far fewer interrupts than core 0
-//      1C: consumer=4           -> P-core 2
-//      2C: consumers=4,6        -> P-core 2, P-core 3
-//      4C: consumers=4,6,8,10   -> P-core 2, P-core 3, E-core 0, E-core 1 (!)
+//    Only 4 physical P-cores exist in total. The benchmark needs a producer
+//    plus up to 4 consumers (5 threads), so something has to give: the main
+//    thread blocks in join() for the entire measured run (it never spins),
+//    so it is safe to park it on the HT sibling of the producer's P-core
+//    instead of burning a whole dedicated P-core on an idle thread.
 //
-//    NOTE: The 4th consumer in the 4C test runs on an E-core (~2x slower than P-core).
-//    For a pure P-core 4C test, HT siblings (4,5,6,7) must be used, which places
-//    two consumers on the same physical P-core — a different tradeoff.
+//    Benchmark assignment:
+//      main=0     : P-core 0, HT-A — idle (blocked in join); absorbs OS interrupts
+//      producer=5 : P-core 0, HT-B — shares main's physical core, safe since main is idle
+//      1C: consumer=1           -> P-core 1
+//      2C: consumers=1,3        -> P-core 1, P-core 2
+//      4C: consumers=1,3,6,8    -> P-core 1, P-core 2, P-core 3, E-core 0 (!)
+//
+//    NOTE: With only 4 physical P-cores and one spent on main+producer, the
+//    4th consumer in the 4C test necessarily spills onto an E-core (~2x
+//    slower, different microarchitecture) — this is a hardware limit, not a
+//    tuning choice. Treat 4C results as "3 P-core + 1 E-core", not a clean
+//    scale-up from 2C.
 //
 // ============================================================================
 
@@ -117,18 +126,15 @@ static void teardown_process() {}
 #endif
 
 // ── Core assignment constants — Intel Core Ultra 5 125H ──────────────────────
-// P-core HT pairs: (0,1) (2,3) (4,5) (6,7); E-cores: 8-15 (no HT)
+// Real HT pairs (from `lscpu --extended`, core_id column): (0,5) (1,2) (3,4) (6,7)
+// E-cores: 8-15 (no HT). See topology block above for the full derivation.
 //
-// Core 0 (P-core 0) is the primary target for Windows timer interrupts and DPCs.
-// The main thread (idle during benchmark) is pinned here to absorb OS noise
-// and shield the producer and consumer cores.
-//
-// Producer on core 2 (P-core 1): receives far fewer interrupts than core 0.
-static constexpr int MAIN_CORE  = 0;   // P-core 0, HT-A — idle; absorbs OS interrupts
-static constexpr int PROD_CORE  = 2;   // P-core 1, HT-A — shielded from interrupts
-static constexpr int CONS0_CORE = 4;   // P-core 2, HT-A — first consumer core
-static constexpr int CONS_STEP  = 2;   // skip HT siblings -> each consumer on a different P-core
-// Result: 1C->{4}  2C->{4,6}  4C->{4,6,8,10}  (8,10 = E-core; ~2x slower than P-core)
+// Main is idle for the whole measured run (blocked in join()), so it shares
+// P-core 0 with the producer instead of consuming a full dedicated P-core.
+static constexpr int MAIN_CORE = 0;   // P-core 0, HT-A — idle; absorbs OS interrupts
+static constexpr int PROD_CORE = 5;   // P-core 0, HT-B — shares main's core (main is idle, not spinning)
+static constexpr int CONSUMER_CORES[] = { 1, 3, 6, 8 }; // P-core 1, P-core 2, P-core 3, E-core 0
+// Result: 1C->{1}  2C->{1,3}  4C->{1,3,6,8}  (8 = E-core; only 4 P-cores exist total)
 
 // ── Clock ─────────────────────────────────────────────────────────────────────
 static std::int64_t now_ns() noexcept {
@@ -150,8 +156,7 @@ void run_benchmark(const char*  label,
                    std::size_t  capacity,
                    std::int64_t rate_limit_ns   = 0,
                    int          producer_core   = PROD_CORE,
-                   int          consumer0_core  = CONS0_CORE,
-                   int          consumer_stride = CONS_STEP)
+                   const int*   consumer_cores  = CONSUMER_CORES)
 {
     const std::size_t total = warmup + measure;
     Queue q(capacity);
@@ -165,8 +170,8 @@ void run_benchmark(const char*  label,
     std::vector<std::thread> cthr;
     cthr.reserve(n_consumers);
     for (std::size_t ci = 0; ci < n_consumers; ++ci) {
-        cthr.emplace_back([&, ci, warmup, consumer0_core, consumer_stride]() {
-            pin_thread(consumer0_core >= 0 ? consumer0_core + (int)ci * consumer_stride : -1);
+        cthr.emplace_back([&, ci, warmup, consumer_cores]() {
+            pin_thread(consumer_cores ? consumer_cores[ci] : -1);
             elevate_thread();
             while (!go.load(std::memory_order_acquire)) {}
 
@@ -220,10 +225,12 @@ void run_benchmark(const char*  label,
 int main() {
     setup_process(MAIN_CORE);
 
-    std::printf("  Core assignment : main=%d  producer=%d  consumer_base=%d  stride=%d\n",
-                MAIN_CORE, PROD_CORE, CONS0_CORE, CONS_STEP);
-    std::printf("  Topology        : P{0,1}=core0  P{2,3}=core1  P{4,5}=core2  P{6,7}=core3  E:{8-15}\n");
-    std::printf("  NOTE            : core 0 absorbs OS interrupts (idle main); producer shielded on core 2\n");
+    std::printf("  Core assignment : main=%d  producer=%d  consumers=%d,%d,%d,%d\n",
+                MAIN_CORE, PROD_CORE,
+                CONSUMER_CORES[0], CONSUMER_CORES[1], CONSUMER_CORES[2], CONSUMER_CORES[3]);
+    std::printf("  Topology        : P{0,5}=core0  P{1,2}=core1  P{3,4}=core2  P{6,7}=core3  E:{8-15}\n");
+    std::printf("  NOTE            : main+producer share core0 (main idle, blocked in join); 4th consumer (%d) is an E-core\n",
+                CONSUMER_CORES[3]);
 #ifdef _WIN32
     std::printf("  Priority        : HIGH_PRIORITY_CLASS + THREAD_PRIORITY_HIGHEST\n");
     std::printf("  Timer           : timeBeginPeriod(1) -> 1 ms granularity\n");
