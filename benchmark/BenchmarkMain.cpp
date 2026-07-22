@@ -111,8 +111,11 @@ static void pin_thread(int core) {
 static void elevate_thread() {
     // SCHED_FIFO: real-time scheduler — requires root or CAP_SYS_NICE.
     // Falls through silently if permission is denied (benchmark runs at normal priority).
+    // Priority 99 (max): kernel-mandatory RT threads such as migration/N run
+    // at 99 and can still preempt us even on an isolated core if left below
+    // that; 90 left that door open.
     struct sched_param p{};
-    p.sched_priority = 90;
+    p.sched_priority = 99;
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &p) != 0)
         std::fprintf(stderr, "  [!] SCHED_FIFO unavailable — run as root\n");
 }
@@ -235,7 +238,7 @@ int main() {
     std::printf("  Priority        : HIGH_PRIORITY_CLASS + THREAD_PRIORITY_HIGHEST\n");
     std::printf("  Timer           : timeBeginPeriod(1) -> 1 ms granularity\n");
 #else
-    std::printf("  Priority        : SCHED_FIFO prio=90  (error shown above if root is required)\n");
+    std::printf("  Priority        : SCHED_FIFO prio=99  (error shown above if root is required)\n");
 #endif
 
     // =========================================================================

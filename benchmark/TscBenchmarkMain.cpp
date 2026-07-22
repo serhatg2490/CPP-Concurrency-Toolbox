@@ -59,7 +59,10 @@ static void pin_thread(int core) {
     pthread_setaffinity_np(pthread_self(), sizeof(s), &s);
 }
 static void elevate_thread() {
-    struct sched_param p{}; p.sched_priority = 90;
+    // Priority 99 (max): kernel-mandatory RT threads such as migration/N run
+    // at 99 and can still preempt us even on an isolated core if left below
+    // that; 90 left that door open.
+    struct sched_param p{}; p.sched_priority = 99;
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &p) != 0)
         std::fprintf(stderr, "  [!] SCHED_FIFO unavailable — run as root\n");
 }
