@@ -6,23 +6,32 @@
 #  for the full measurement history behind each step below).
 #
 #  Applies, in order:
-#    1) Disables deep C-states (C6/C10) on the cores the benchmarks pin to.
-#    2) Disables the kernel's RT runtime throttle.
-#    3) Adds isolcpus= / nohz_full= / rcu_nocbs= to the kernel command line
+#    1) Sets the CPU governor to "performance" and stops irqbalance, if either
+#       isn't already in that state (original values saved under /run so
+#       --undo can restore them precisely).
+#    2) Disables deep C-states (C6/C10) on the cores the benchmarks pin to.
+#    3) Disables the kernel's RT runtime throttle.
+#    4) Adds isolcpus= / nohz_full= / rcu_nocbs= to the kernel command line
 #       (GRUB) so the general scheduler and periodic timer tick stay off
 #       those cores entirely.
 #
-#  Steps 1-2 are runtime-only: instant, safe, and automatically undone by a
-#  reboot. Step 3 is persistent and REQUIRES A REBOOT to take effect; it is
+#  Steps 1-3 are runtime-only: instant, safe, and automatically undone by a
+#  reboot. Step 4 is persistent and REQUIRES A REBOOT to take effect; it is
 #  gated behind a confirmation prompt (skip with --yes) because it edits
 #  /etc/default/grub.
 #
+#  Zero-flag, run-it-twice flow: if isolcpus/nohz_full/rcu_nocbs aren't set
+#  yet, steps 1-3 would just be wiped by the reboot step 4 needs anyway, so
+#  this script skips them and goes straight to step 4. Rebooting, then
+#  running this exact same command again, finds isolcpus already set and
+#  applies 1-3 for real while step 4 auto-skips. No flags needed either time.
+#
 #  Usage:
-#    sudo ./scripts/tune-benchmark-host.sh            # interactive
-#    sudo ./scripts/tune-benchmark-host.sh --yes       # no prompts
-#    sudo ./scripts/tune-benchmark-host.sh --no-grub   # skip step 3 entirely
+#    sudo ./scripts/tune-benchmark-host.sh            # run before AND after the reboot
+#    sudo ./scripts/tune-benchmark-host.sh --yes       # no confirmation prompts
+#    sudo ./scripts/tune-benchmark-host.sh --no-grub   # never touch GRUB, only steps 1-3
 #    ./scripts/tune-benchmark-host.sh --status         # report current state, no changes
-#    sudo ./scripts/tune-benchmark-host.sh --undo      # revert everything below
+#    sudo ./scripts/tune-benchmark-host.sh --undo      # revert everything above
 #    sudo ./scripts/tune-benchmark-host.sh --undo --yes
 # ============================================================================
 
@@ -32,6 +41,12 @@ set -euo pipefail
 # (see the "Core assignment constants" block in BenchmarkMain.cpp / TscBenchmarkMain.cpp).
 CORES="0,1,3,5,6,8"
 CORE_LIST="0,1,2,3,4,5,6,7,8"   # isolcpus range: full P-core HT pairs + E-core0 (doc §16)
+
+# State files (tmpfs, cleared on reboot -- matches the reboot-transient nature
+# of steps 1-3) used to remember pre-change values so --undo can restore them
+# precisely instead of guessing.
+GOV_STATE_FILE="/run/tune-benchmark-host.governor"
+IRQBALANCE_STATE_FILE="/run/tune-benchmark-host.irqbalance"
 
 ASSUME_YES=0
 DO_GRUB=1
@@ -49,6 +64,12 @@ for arg in "$@"; do
 done
 
 report_status() {
+    echo "== CPU governor =="
+    cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u || echo "(cpufreq not available)"
+    echo
+    echo "== irqbalance =="
+    systemctl is-active irqbalance 2>/dev/null || true
+    echo
     echo "== C-state (C6/C10 disable status, cores $CORES) =="
     IFS=',' read -ra core_arr <<< "$CORES"
     for c in "${core_arr[@]}"; do
@@ -82,7 +103,27 @@ fi
 
 if [[ "$UNDO" -eq 1 ]]; then
     echo "############################################################"
-    echo "# Undo 1) Re-enable deep C-states (C6, C10) — cores: $CORES"
+    echo "# Undo 1) Restore CPU governor and irqbalance"
+    echo "############################################################"
+    if [[ -f "$IRQBALANCE_STATE_FILE" ]]; then
+        systemctl start irqbalance
+        rm -f "$IRQBALANCE_STATE_FILE"
+        echo "irqbalance restarted."
+    else
+        echo "irqbalance: nothing to restore (was already inactive, or not touched)."
+    fi
+    if [[ -f "$GOV_STATE_FILE" ]]; then
+        orig_gov=$(cat "$GOV_STATE_FILE")
+        cpupower frequency-set -g "$orig_gov" >/dev/null
+        rm -f "$GOV_STATE_FILE"
+        echo "Governor restored to '$orig_gov'."
+    else
+        echo "Governor: nothing to restore (was already 'performance', or not touched)."
+    fi
+    echo
+
+    echo "############################################################"
+    echo "# Undo 2) Re-enable deep C-states (C6, C10) — cores: $CORES"
     echo "############################################################"
     cpupower -c "$CORES" idle-set -e 2   # C6
     cpupower -c "$CORES" idle-set -e 3   # C10
@@ -90,7 +131,7 @@ if [[ "$UNDO" -eq 1 ]]; then
     echo
 
     echo "############################################################"
-    echo "# Undo 2) Restore RT runtime throttling to the kernel default"
+    echo "# Undo 3) Restore RT runtime throttling to the kernel default"
     echo "############################################################"
     sysctl -w kernel.sched_rt_runtime_us=950000
     echo "Done."
@@ -98,15 +139,15 @@ if [[ "$UNDO" -eq 1 ]]; then
 
     if [[ ! -f /etc/default/grub.bak ]]; then
         echo "############################################################"
-        echo "# Undo 3) No /etc/default/grub.bak found — skipping GRUB revert."
+        echo "# Undo 4) No /etc/default/grub.bak found — skipping GRUB revert."
         echo "############################################################"
-        echo "(Steps 1-2 were reverted; isolcpus/nohz_full/rcu_nocbs, if set, must be"
+        echo "(Steps 1-3 were reverted; isolcpus/nohz_full/rcu_nocbs, if set, must be"
         echo " removed from /etc/default/grub by hand, followed by update-grub + reboot.)"
         exit 0
     fi
 
     echo "############################################################"
-    echo "# Undo 3) Restore /etc/default/grub from backup (PERSISTENT, REQUIRES REBOOT)"
+    echo "# Undo 4) Restore /etc/default/grub from backup (PERSISTENT, REQUIRES REBOOT)"
     echo "############################################################"
     diff -u /etc/default/grub /etc/default/grub.bak || true
 
@@ -114,7 +155,7 @@ if [[ "$UNDO" -eq 1 ]]; then
         read -r -p "Restore the backup and run update-grub? [y/N] " reply
         case "$reply" in
             [yY]|[yY][eE][sS]) ;;
-            *) echo "Cancelled. Steps 1-2 were reverted, GRUB was left untouched."; exit 0 ;;
+            *) echo "Cancelled. Steps 1-3 were reverted, GRUB was left untouched."; exit 0 ;;
         esac
     fi
 
@@ -126,37 +167,76 @@ if [[ "$UNDO" -eq 1 ]]; then
     exit 0
 fi
 
-echo "############################################################"
-echo "# 1) Disable deep C-states (C6, C10) — cores: $CORES"
-echo "############################################################"
-cpupower -c "$CORES" idle-set -d 2   # C6
-cpupower -c "$CORES" idle-set -d 3   # C10
-echo "Done. (Reset automatically on reboot.)"
-echo
+# Check GRUB state up front: if isolcpus/nohz_full/rcu_nocbs aren't set yet,
+# steps 1-3 (runtime-only) would just be wiped seconds later by the reboot
+# that step 4 is about to require -- so skip them and go straight to step 4.
+# After rebooting, running this exact same command again finds isolcpus
+# already set, so it applies 1-3 for real and step 4 auto-skips. No flags
+# needed on either run.
+TARGET_LINE="isolcpus=${CORE_LIST} nohz_full=${CORE_LIST} rcu_nocbs=${CORE_LIST}"
+GRUB_ALREADY_SET=0
+if grep -q "isolcpus=${CORE_LIST}" /etc/default/grub 2>/dev/null; then
+    GRUB_ALREADY_SET=1
+fi
 
-echo "############################################################"
-echo "# 2) Disable RT runtime throttling"
-echo "############################################################"
-sysctl -w kernel.sched_rt_runtime_us=-1
-echo "Done. (Reset automatically on reboot.)"
-echo
+if [[ "$DO_GRUB" -eq 1 && "$GRUB_ALREADY_SET" -eq 0 ]]; then
+    echo "isolcpus/nohz_full/rcu_nocbs are not set yet, and applying them (step 4)"
+    echo "requires a reboot that would immediately wipe steps 1-3 anyway -- skipping"
+    echo "governor/irqbalance, C-state and RT-throttle tuning this run."
+    echo "Re-run this exact same command after rebooting to apply them for real."
+    echo
+else
+    echo "############################################################"
+    echo "# 1) Set CPU governor to performance, stop irqbalance"
+    echo "############################################################"
+    cur_gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "")
+    if [[ -n "$cur_gov" && "$cur_gov" != "performance" ]]; then
+        echo "$cur_gov" > "$GOV_STATE_FILE"
+        cpupower frequency-set -g performance >/dev/null
+        echo "Governor: $cur_gov -> performance (original saved for --undo)."
+    else
+        echo "Governor already 'performance' (or cpufreq unavailable) — nothing to do."
+    fi
+    if systemctl is-active --quiet irqbalance 2>/dev/null; then
+        touch "$IRQBALANCE_STATE_FILE"
+        systemctl stop irqbalance
+        echo "irqbalance: active -> stopped (will be restarted by --undo)."
+    else
+        echo "irqbalance already inactive (or not installed) — nothing to do."
+    fi
+    echo "(Both reset automatically on reboot.)"
+    echo
+
+    echo "############################################################"
+    echo "# 2) Disable deep C-states (C6, C10) — cores: $CORES"
+    echo "############################################################"
+    cpupower -c "$CORES" idle-set -d 2   # C6
+    cpupower -c "$CORES" idle-set -d 3   # C10
+    echo "Done. (Reset automatically on reboot.)"
+    echo
+
+    echo "############################################################"
+    echo "# 3) Disable RT runtime throttling"
+    echo "############################################################"
+    sysctl -w kernel.sched_rt_runtime_us=-1
+    echo "Done. (Reset automatically on reboot.)"
+    echo
+fi
 
 if [[ "$DO_GRUB" -eq 0 ]]; then
     echo "--no-grub given, skipping the isolcpus/nohz_full/rcu_nocbs step."
     exit 0
 fi
 
-TARGET_LINE="isolcpus=${CORE_LIST} nohz_full=${CORE_LIST} rcu_nocbs=${CORE_LIST}"
-
-if grep -q "isolcpus=${CORE_LIST}" /etc/default/grub 2>/dev/null; then
+if [[ "$GRUB_ALREADY_SET" -eq 1 ]]; then
     echo "############################################################"
-    echo "# 3) isolcpus/nohz_full/rcu_nocbs already set, skipping."
+    echo "# 4) isolcpus/nohz_full/rcu_nocbs already set, skipping."
     echo "############################################################"
     exit 0
 fi
 
 echo "############################################################"
-echo "# 3) isolcpus/nohz_full/rcu_nocbs will be added to GRUB (PERSISTENT, REQUIRES REBOOT)"
+echo "# 4) isolcpus/nohz_full/rcu_nocbs will be added to GRUB (PERSISTENT, REQUIRES REBOOT)"
 echo "############################################################"
 echo "About to add: $TARGET_LINE"
 echo "Affected cores ($CORE_LIST) will be fully withdrawn from the general scheduler —"
@@ -166,7 +246,7 @@ if [[ "$ASSUME_YES" -ne 1 ]]; then
     read -r -p "Proceed? [y/N] " reply
     case "$reply" in
         [yY]|[yY][eE][sS]) ;;
-        *) echo "Cancelled. Steps (1) and (2) were applied, (3) was skipped."; exit 0 ;;
+        *) echo "Cancelled. Nothing was changed."; exit 0 ;;
     esac
 fi
 
@@ -185,6 +265,9 @@ update-grub
 echo
 echo "Done. A REBOOT is required for the change to take effect:"
 echo "  sudo reboot"
+echo "After rebooting, run this exact same command again (no flags needed) to"
+echo "apply governor/irqbalance/C-state/RT-throttle tuning for real -- step 4"
+echo "will auto-detect isolcpus is already set and skip itself."
 echo "Post-reboot verification:"
 echo "  cat /proc/cmdline"
 echo "  cat /sys/devices/system/cpu/isolated   # should return ${CORE_LIST}"
