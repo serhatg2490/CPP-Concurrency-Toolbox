@@ -22,11 +22,8 @@
 #    sudo ./scripts/tune-benchmark-host.sh --yes       # no prompts
 #    sudo ./scripts/tune-benchmark-host.sh --no-grub   # skip step 3 entirely
 #    ./scripts/tune-benchmark-host.sh --status         # report current state, no changes
-#
-#  Undo:
-#    sudo cpupower -c "$CORES" idle-set -e 2 && sudo cpupower -c "$CORES" idle-set -e 3
-#    sudo sysctl -w kernel.sched_rt_runtime_us=950000
-#    sudo cp /etc/default/grub.bak /etc/default/grub && sudo update-grub && sudo reboot
+#    sudo ./scripts/tune-benchmark-host.sh --undo      # revert everything below
+#    sudo ./scripts/tune-benchmark-host.sh --undo --yes
 # ============================================================================
 
 set -euo pipefail
@@ -39,12 +36,14 @@ CORE_LIST="0,1,2,3,4,5,6,7,8"   # isolcpus range: full P-core HT pairs + E-core0
 ASSUME_YES=0
 DO_GRUB=1
 STATUS_ONLY=0
+UNDO=0
 
 for arg in "$@"; do
     case "$arg" in
         --yes|-y)   ASSUME_YES=1 ;;
         --no-grub)  DO_GRUB=0 ;;
         --status)   STATUS_ONLY=1 ;;
+        --undo)     UNDO=1 ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
@@ -79,6 +78,52 @@ fi
 if [[ "$EUID" -ne 0 ]]; then
     echo "This script requires root (for cpupower/sysctl/GRUB). Run it with sudo." >&2
     exit 1
+fi
+
+if [[ "$UNDO" -eq 1 ]]; then
+    echo "############################################################"
+    echo "# Undo 1) Re-enable deep C-states (C6, C10) — cores: $CORES"
+    echo "############################################################"
+    cpupower -c "$CORES" idle-set -e 2   # C6
+    cpupower -c "$CORES" idle-set -e 3   # C10
+    echo "Done."
+    echo
+
+    echo "############################################################"
+    echo "# Undo 2) Restore RT runtime throttling to the kernel default"
+    echo "############################################################"
+    sysctl -w kernel.sched_rt_runtime_us=950000
+    echo "Done."
+    echo
+
+    if [[ ! -f /etc/default/grub.bak ]]; then
+        echo "############################################################"
+        echo "# Undo 3) No /etc/default/grub.bak found — skipping GRUB revert."
+        echo "############################################################"
+        echo "(Steps 1-2 were reverted; isolcpus/nohz_full/rcu_nocbs, if set, must be"
+        echo " removed from /etc/default/grub by hand, followed by update-grub + reboot.)"
+        exit 0
+    fi
+
+    echo "############################################################"
+    echo "# Undo 3) Restore /etc/default/grub from backup (PERSISTENT, REQUIRES REBOOT)"
+    echo "############################################################"
+    diff -u /etc/default/grub /etc/default/grub.bak || true
+
+    if [[ "$ASSUME_YES" -ne 1 ]]; then
+        read -r -p "Restore the backup and run update-grub? [y/N] " reply
+        case "$reply" in
+            [yY]|[yY][eE][sS]) ;;
+            *) echo "Cancelled. Steps 1-2 were reverted, GRUB was left untouched."; exit 0 ;;
+        esac
+    fi
+
+    cp /etc/default/grub.bak /etc/default/grub
+    update-grub
+    echo
+    echo "Done. A REBOOT is required for the GRUB change to take effect:"
+    echo "  sudo reboot"
+    exit 0
 fi
 
 echo "############################################################"
