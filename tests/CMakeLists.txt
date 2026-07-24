@@ -9,13 +9,13 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 add_executable(threadpool_tests test_threadpool.cpp)
-target_link_libraries(threadpool_tests PRIVATE ThreadPool GTest::gtest_main)
+target_link_libraries(threadpool_tests PRIVATE CppConcurrencyToolbox GTest::gtest_main)
 
 add_executable(spsc_queue_tests test_spsc_queue.cpp)
-target_link_libraries(spsc_queue_tests PRIVATE ThreadPool GTest::gtest_main)
+target_link_libraries(spsc_queue_tests PRIVATE CppConcurrencyToolbox GTest::gtest_main)
 
 add_executable(spmc_queue_tests test_spmc_queue.cpp)
-target_link_libraries(spmc_queue_tests PRIVATE ThreadPool GTest::gtest_main)
+target_link_libraries(spmc_queue_tests PRIVATE CppConcurrencyToolbox GTest::gtest_main)
 
 include(GoogleTest)
 gtest_discover_tests(threadpool_tests)

@@ -75,23 +75,39 @@ No external runtime dependencies — the library itself is header-only with no t
 
 ### Build
 
+Building and testing are two separate, composable steps — matching CMake/CTest's own design (and avoiding the classic "`build.sh` also silently runs the whole test suite" surprise):
+
 ```bash
 # Linux
+./build.sh              # configure (if needed) + incremental build
+./build.sh --clean      # wipe build/ first, then configure + build from scratch
+
+./test.sh               # run unit tests + benchmarks against the existing build (~20s)
+./test.sh --unit-only   # unit tests only, skips the ~15s benchmark run
+
+# ...or drive CMake/CTest directly
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j"$(nproc)"
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure          # unit tests + benchmarks
+ctest --test-dir build --output-on-failure -LE benchmark  # unit tests only
 ```
 
 ```bat
 :: Windows
 build.bat
+build.bat --clean
+
+test.bat
+test.bat --unit-only
 ```
 
-(`build.bat` runs `cmake -B build -S .`, `cmake --build build --config Release`, and `ctest --test-dir build -C Release --verbose` in sequence.)
+`build.sh`/`build.bat` only build — by default incrementally (fast, reuses the existing `build/` if present), or from a clean slate with `--clean`. `test.sh`/`test.bat` only run CTest against whatever's already built (they error out with a clear message if you haven't run the build script yet), defaulting to everything, `--unit-only` to skip the benchmark run.
 
 This produces:
 - Three test binaries: `threadpool_tests`, `spsc_queue_tests`, `spmc_queue_tests`
 - Three benchmark binaries: `spmc_benchmark`, `spmc_tsc_benchmark`, `spmc_gbenchmark`
+
+All six are registered with CTest; the three benchmarks carry a `benchmark` label so they can be included or excluded independently of the fast unit-test pass (see §5).
 
 ### Core Pinning & Affinity Setup
 
@@ -139,11 +155,11 @@ Three GoogleTest binaries, all built from [`tests/`](tests/):
 | `spmc_queue_tests` | [`test_spmc_queue.cpp`](tests/test_spmc_queue.cpp) | All of the above plus: multi-consumer "each item received exactly once" correctness under both `try_pop` and blocking `pop_wait`, heavy-object (non-trivial, allocation-heavy) payload correctness under concurrent consumers, destructor draining of unconsumed elements, `std::expected`-based `try_pop_expected`, blocking `emplace_wait`/`pop_wait` semantics. |
 | `threadpool_tests` | [`test_threadpool.cpp`](tests/test_threadpool.cpp) | Lambda/rvalue/normal-function/member-function/container-argument task submission, `std::future`-based result retrieval, `hardware_concurrency()` auto-sizing, atomic-increment correctness under concurrent task submission, throughput under 1000 queued tasks, heavy CPU load handling. |
 
-Run everything:
+Run just the unit tests (fast, ~7s):
 
 ```bash
 cd build
-ctest --output-on-failure
+ctest --output-on-failure -LE benchmark
 ```
 
 **Result on this repository, as of this build:**
@@ -152,6 +168,8 @@ ctest --output-on-failure
 100% tests passed, 0 tests failed out of 53
 Total Test time (real) = 7.27 sec
 ```
+
+Running `ctest --output-on-failure` with no filter (or `./test.sh` / `test.bat`, see §4) runs these same 53 tests **plus** the 3 benchmark binaries from §6 (registered as CTest tests too, `benchmark`-labeled) — 56 total, ~20s, still all green.
 
 A few of the tests also print an informal throughput number to stdout (not a substitute for the dedicated benchmark suite in §6, but a useful smoke-test figure):
 
