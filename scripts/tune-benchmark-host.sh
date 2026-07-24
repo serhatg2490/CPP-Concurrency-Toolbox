@@ -14,7 +14,7 @@
 #       ramp-up jitter. Standard low-latency-tuning practice; measured on
 #       this host to NOT change the residual 1C tail (see doc §21), kept as
 #       baseline hygiene the same way governor/C-state/RT-throttle are.
-#    3) Disables deep C-states (C6/C10) on the cores the benchmarks pin to.
+#    3) Disables C-states (C1E/C6/C10) on the cores the benchmarks pin to.
 #    4) Disables the kernel's RT runtime throttle.
 #    5) Adds isolcpus= / nohz_full= / rcu_nocbs= to the kernel command line
 #       (GRUB) so the general scheduler and periodic timer tick stay off
@@ -84,12 +84,12 @@ report_status() {
         echo "cpu$c: min=$(cat "$fd/scaling_min_freq") max=$(cat "$fd/scaling_max_freq") cur=$(cat "$fd/scaling_cur_freq")"
     done
     echo
-    echo "== C-state (C6/C10 disable status, cores $CORES) =="
+    echo "== C-state (C1E/C6/C10 disable status, cores $CORES) =="
     IFS=',' read -ra core_arr <<< "$CORES"
     for c in "${core_arr[@]}"; do
         for state_dir in /sys/devices/system/cpu/cpu"$c"/cpuidle/state*/; do
             name=$(cat "$state_dir/name")
-            [[ "$name" == "C6" || "$name" == "C10" ]] || continue
+            [[ "$name" == "C1E" || "$name" == "C6" || "$name" == "C10" ]] || continue
             dis=$(cat "$state_dir/disable")
             echo "cpu$c $name: disable=$dis"
         done
@@ -154,8 +154,9 @@ if [[ "$UNDO" -eq 1 ]]; then
     echo
 
     echo "############################################################"
-    echo "# Undo 3) Re-enable deep C-states (C6, C10) — cores: $CORES"
+    echo "# Undo 3) Re-enable C-states (C1E, C6, C10) — cores: $CORES"
     echo "############################################################"
+    cpupower -c "$CORES" idle-set -e 1   # C1E
     cpupower -c "$CORES" idle-set -e 2   # C6
     cpupower -c "$CORES" idle-set -e 3   # C10
     echo "Done."
@@ -264,11 +265,13 @@ else
     echo
 
     echo "############################################################"
-    echo "# 3) Disable deep C-states (C6, C10) — cores: $CORES"
+    echo "# 3) Disable C-states (C1E, C6, C10) — cores: $CORES"
     echo "############################################################"
+    cpupower -c "$CORES" idle-set -d 1   # C1E
     cpupower -c "$CORES" idle-set -d 2   # C6
     cpupower -c "$CORES" idle-set -d 3   # C10
-    echo "Done. (Reset automatically on reboot.)"
+    echo "Done. (Reset automatically on reboot. Measured on this host to NOT change"
+    echo " the residual 1C tail -- kept as standard low-latency hygiene regardless.)"
     echo
 
     echo "############################################################"
