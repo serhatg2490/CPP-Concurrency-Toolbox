@@ -101,7 +101,7 @@ test.bat
 test.bat --unit-only
 ```
 
-`build.sh`/`build.bat` only build — by default incrementally (fast, reuses the existing `build/` if present), or from a clean slate with `--clean`. `test.sh`/`test.bat` only run CTest against whatever's already built (they error out with a clear message if you haven't run the build script yet), defaulting to everything, `--unit-only` to skip the benchmark run.
+`build.sh`/`build.bat` only build — by default incrementally (fast, reuses the existing `build/` if present), or from a clean slate with `--clean`. `test.sh`/`test.bat` only run CTest against whatever's already built (they error out with a clear message if you haven't run the build script yet), defaulting to everything, `--unit-only` to skip the benchmark run. Unit-test output is suppressed on success (pass/fail summary only); benchmark output is always shown in full — the point of running them is to see the latency numbers, not just confirm they didn't crash.
 
 This produces:
 - Three test binaries: `threadpool_tests`, `spsc_queue_tests`, `spmc_queue_tests`
