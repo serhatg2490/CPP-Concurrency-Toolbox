@@ -17,7 +17,11 @@ target_link_libraries(spsc_queue_tests PRIVATE CppConcurrencyToolbox GTest::gtes
 add_executable(spmc_queue_tests test_spmc_queue.cpp)
 target_link_libraries(spmc_queue_tests PRIVATE CppConcurrencyToolbox GTest::gtest_main)
 
+add_executable(spmc_broadcast_queue_tests test_spmc_broadcast_queue.cpp)
+target_link_libraries(spmc_broadcast_queue_tests PRIVATE CppConcurrencyToolbox GTest::gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(threadpool_tests)
 gtest_discover_tests(spsc_queue_tests)
 gtest_discover_tests(spmc_queue_tests)
+gtest_discover_tests(spmc_broadcast_queue_tests)
