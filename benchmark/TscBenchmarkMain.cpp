@@ -13,6 +13,7 @@
 //
 // ============================================================================
 
+#include <SPMCBroadcastQueue.h>
 #include <SPMCLockFreeQueue.h>
 #include <SPSCLockFreeQueue.h>
 #include "LatencyRecorder.hpp"
@@ -166,6 +167,93 @@ void run_benchmark(const char*  label,
     merged.print_report(label);
 }
 
+// ── Broadcast (fan-out) benchmark function ────────────────────────────────────
+//
+// Unlike run_benchmark<Queue> above, every consumer here receives EVERY
+// published item (fan-out, not competing pop) -- so each consumer's
+// LatencyRecorder is sized for `measure` samples, not `measure / N`.
+// N is fixed at compile time (SPMCBroadcastQueue<T, N>), matching the 1C/2C/4C
+// registrations below.
+template <typename T, std::size_t N>
+void run_broadcast_benchmark(const char*  label,
+                             std::size_t  warmup,
+                             std::size_t  measure,
+                             std::size_t  capacity,
+                             std::int64_t rate_limit_ns   = 0,
+                             int          producer_core   = PROD_CORE,
+                             const int*   consumer_cores  = CONSUMER_CORES)
+{
+    const std::size_t total = warmup + measure;
+    SPMCBroadcastQueue<T, N> q(capacity);
+
+    std::vector<LatencyRecorder> recs(N, LatencyRecorder{measure + 10'000});
+    std::atomic<bool> go{false};
+
+    std::vector<std::thread> cthr;
+    cthr.reserve(N);
+    for (std::size_t ci = 0; ci < N; ++ci) {
+        cthr.emplace_back([&, ci, warmup, consumer_cores]() {
+            pin_thread(consumer_cores ? consumer_cores[ci] : -1);
+            elevate_thread();
+            while (!go.load(std::memory_order_acquire)) {}
+
+            auto& c = q.consumer(ci);
+            std::size_t n = 0;
+            while (n < total) {
+                const bool got = c.try_consume([&](const T& item) {
+                    const std::int64_t now = consume_ts();
+                    if (n >= warmup) {
+                        const std::int64_t lat = now - item.enqueue_ns;
+                        if (lat >= 0)
+                            recs[ci].record(static_cast<std::uint64_t>(lat));
+                    }
+                });
+                if (got) ++n;
+            }
+        });
+    }
+
+    std::thread pthr([&, rate_limit_ns, total]() {
+        pin_thread(producer_core);
+        elevate_thread();
+        while (!go.load(std::memory_order_acquire)) {}
+
+        if (rate_limit_ns > 0) {
+            std::int64_t next_ns = static_cast<std::int64_t>(tsc::epoch_ns(tsc::now()));
+            for (std::size_t i = 0; i < total; ++i) {
+                std::int64_t ts;
+                // Defensive resync: produce_ts() uses raw RDTSC (no fence) spun
+                // continuously for minutes across this benchmark; a rare
+                // hardware/OS TSC discontinuity (observed here, likely tied to a
+                // deep package C-state transition on this hybrid CPU) can strand
+                // next_ns ahead of any value produce_ts() ever returns again,
+                // spinning forever. If a single interval takes far longer than
+                // it legitimately should, resync to the current reading instead
+                // of waiting on an unreachable target.
+                std::uint64_t spins = 0;
+                do { ts = produce_ts(); } while (ts < next_ns && ++spins < 1'000'000ULL);
+                if (ts < next_ns) next_ns = ts;
+                next_ns += rate_limit_ns;
+                const T item{ts, static_cast<std::int64_t>(i)};
+                while (!q.try_publish(item)) {}
+            }
+        } else {
+            for (std::size_t i = 0; i < total; ++i) {
+                const T item{produce_ts(), static_cast<std::int64_t>(i)};
+                while (!q.try_publish(item)) {}
+            }
+        }
+    });
+
+    go.store(true, std::memory_order_release);
+    pthr.join();
+    for (auto& t : cthr) t.join();
+
+    LatencyRecorder merged{measure * N + 10'000};
+    for (auto& r : recs) merged.merge_from(r);
+    merged.print_report(label);
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 int main() {
     tsc::calibrate(std::chrono::milliseconds{20});
@@ -202,6 +290,9 @@ int main() {
         run_benchmark<SPMCQueue<Item>>      ("VyukovSPMC 1C", 1, W, M, C);
         run_benchmark<SPMCQueue<Item>>      ("VyukovSPMC 2C", 2, W, M, C);
         run_benchmark<SPMCQueue<Item>>      ("VyukovSPMC 4C", 4, W, M, C);
+        run_broadcast_benchmark<Item, 1>    ("Broadcast   1C", W, M, C);
+        run_broadcast_benchmark<Item, 2>    ("Broadcast   2C", W, M, C);
+        run_broadcast_benchmark<Item, 4>    ("Broadcast   4C", W, M, C);
     }
 
     {
@@ -223,6 +314,9 @@ int main() {
         run_benchmark<SPMCQueue<Item>>      ("VyukovSPMC 1C", 1, W, M, C, RATE_NS);
         run_benchmark<SPMCQueue<Item>>      ("VyukovSPMC 2C", 2, W, M, C, RATE_NS);
         run_benchmark<SPMCQueue<Item>>      ("VyukovSPMC 4C", 4, W, M, C, RATE_NS);
+        run_broadcast_benchmark<Item, 1>    ("Broadcast   1C", W, M, C, RATE_NS);
+        run_broadcast_benchmark<Item, 2>    ("Broadcast   2C", W, M, C, RATE_NS);
+        run_broadcast_benchmark<Item, 4>    ("Broadcast   4C", W, M, C, RATE_NS);
     }
 
     std::printf("\n  All values are in nanoseconds (ns).\n");

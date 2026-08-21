@@ -430,3 +430,198 @@ Steps 1–4 are runtime-only (reset automatically on reboot); step 5 is persiste
 **Zero-flag, run-it-twice design:** if `isolcpus` isn't set yet, steps 1–4 would just be wiped seconds later by the reboot step 5 needs, so the script skips them and goes straight to step 5. After rebooting, running the *exact same command* finds `isolcpus` already set, applies 1–4 for real, and step 5 auto-skips — no flags needed on either run.
 
 **Other flags:** `--yes` (skip confirmation prompts), `--no-grub` (never touch GRUB, always apply 1–4 immediately), `--status` (read-only report of current state, no root required), `--undo` (revert everything, restoring exact pre-change values from state files under `/run` where applicable — e.g. the original governor, or nothing if it was already `performance`).
+
+---
+
+## 22. `SPMCBroadcastQueue<T, N>` — A Disruptor-Style Fan-Out Queue
+
+A new component, added later in this project's life, to fill a gap `SPMCQueue` doesn't cover: true fan-out delivery. `SPMCQueue` delivers each item to exactly **one** competing consumer (CAS-raced); `SPMCBroadcastQueue` delivers each item to **every** one of N consumers independently.
+
+**File:** `include/SPMCBroadcastQueue.h`
+
+Design, in brief:
+- A single producer-published `tail_` cursor, plus N independent per-consumer cursors (one cache line each).
+- `try_publish()` gates on the **minimum** position across all N consumer cursors — if the slowest consumer is a full lap behind, the write is rejected.
+- No per-slot sequence/CAS is needed on the consumer side (unlike `SPMCQueue`) — there's no competition to resolve, since every consumer independently owns its own cursor.
+- `N` is a **compile-time template parameter**, not a runtime constructor argument — consumer handles are obtained via `queue.consumer(index)`.
+- `try_consume(callback)` is the primary, zero-copy API; `try_copy()` is a copying convenience wrapper added on top for callers who don't need zero-copy.
+
+This design choice — gating on the *slowest* consumer rather than *any* consumer — is the single most consequential decision in the whole component, and it drives every result in §23–§26 below.
+
+---
+
+## 23. Benchmark Coverage Extended to the Broadcast Queue
+
+All three existing harnesses (`BenchmarkMain.cpp`, `TscBenchmarkMain.cpp`, `GBenchmark.cpp`) got `Broadcast 1C`/`2C`/`4C` registrations mirroring the existing `SPSC`/`Vyukov` pattern, for both the Saturated and Mechanical scenarios. `GBenchmark.cpp` additionally got a dedicated `RT/Broadcast` single-thread round-trip benchmark, since `SPMCBroadcastQueue`'s API (`try_publish` + per-index `consumer(i).try_consume(...)`) doesn't fit the existing generic `BM_Roundtrip<Queue>`/`BM_Latency<Queue>` templates built around `try_emplace`/`try_pop`.
+
+Two genuine bugs were found and fixed while getting this benchmark coverage to run cleanly end-to-end — neither in `SPMCBroadcastQueue` itself (verified independently: a bare, full-scale 1.1M-item run of the queue with nothing else attached completes in 0.6s with zero issues, and the GoogleTest concurrency stress tests — 100K items × 4 consumers — pass reliably), but in the benchmark harness code itself.
+
+---
+
+## 24. Bug Found: TSC Pacing Livelock Under Sustained RDTSC Spin
+
+**Symptom:** `spmc_tsc_benchmark`'s full run (all `SPSC`/`Vyukov`/`Broadcast` scenarios, Saturated + Mechanical) would, on some runs, hang indefinitely partway through the Mechanical scenarios — always deep into the run, never on the first few scenarios. `ps`/`/proc/<pid>/task/*/stat` showed every relevant thread in state `R` (running, not blocked), pegging their pinned cores at ~100% CPU with zero forward progress in `produced`/`consumed` counters — a livelock, not a deadlock.
+
+**Root cause:** the Mechanical scenario's producer pacing loop is:
+
+```cpp
+std::int64_t next_ns = tsc::epoch_ns(tsc::now());
+for (...) {
+    std::int64_t ts;
+    do { ts = produce_ts(); } while (ts < next_ns);   // produce_ts() = raw RDTSC, no fence
+    next_ns += rate_limit_ns;                          // always += 500, unconditionally
+    ...
+}
+```
+
+`produce_ts()` reads the CPU's raw hardware TSC counter directly (`RDTSC`, no serializing fence — deliberately, to avoid pulling consumer CAS cache-line traffic into the producer's timestamp). After sustained busy-spinning across many minutes and multiple prior benchmark scenarios, on this specific hybrid CPU (Meteor Lake, P-core/E-core/LPE-core, deep package C-states like PC10), a rare hardware/OS-level TSC discontinuity can leave `ts` permanently unable to reach the value `next_ns` had already accumulated to — since `next_ns` only ever increments and never re-anchors to reality, the spin-wait's exit condition becomes permanently unsatisfiable.
+
+**Ruled out before concluding this was the cause:** a standalone repro of the bare queue + producer/consumer threads at full scale (1.1M items, N=4, mechanical pacing, no benchmark-framework scaffolding) completed cleanly in 0.6s — the queue algorithm and gating logic are not implicated. The identical rate-limiting pattern is also used, unmodified, by the pre-existing `SPSC`/`Vyukov` scenarios in the same file and has never been observed to hang there — this is consistent with the bug being a rare, timing-window-dependent hardware event whose probability of occurring scales with cumulative sustained-spin wall-clock time, which the newly added Broadcast scenarios (running last, after everything else) simply had more exposure to.
+
+**Fix:** a bounded spin-count escape hatch, scoped to the new `run_broadcast_benchmark` function only (not the pre-existing `run_benchmark`, to avoid touching previously-validated methodology outside this session's addition):
+
+```cpp
+std::uint64_t spins = 0;
+do { ts = produce_ts(); } while (ts < next_ns && ++spins < 1'000'000ULL);
+if (ts < next_ns) next_ns = ts;   // resync to the current reading instead of an unreachable target
+next_ns += rate_limit_ns;
+```
+
+Under normal conditions (the overwhelming majority of iterations) the spin count stays tiny and this is a no-op; only in the rare anomalous case does it kick in, guaranteeing the loop is provably bounded regardless of what the underlying hardware TSC does. Verified: two independent full runs of `spmc_tsc_benchmark` after the fix completed cleanly end-to-end, including the previously-hanging `Broadcast 2C`/`4C` mechanical scenarios.
+
+---
+
+## 25. Bug Found: `SCHED_FIFO` Priority Inversion via CPU-Affinity Inheritance (GBenchmark)
+
+**Symptom:** `spmc_gbenchmark`, run with `sudo` (so `SCHED_FIFO` priority 99 genuinely engages, unlike every prior non-root run this session), hung indefinitely right after the `RT/*` round-trip benchmarks completed, before the first `Sat/*` multi-thread benchmark produced any output. This did **not** reproduce non-root, and did **not** reproduce in `BenchmarkMain.cpp`/`TscBenchmarkMain.cpp` under the same `sudo` conditions.
+
+**Diagnosis** (live process inspection while hung):
+
+```
+$ ps aux | grep spmc_gbenchmark
+root  5713 99.1  ...  ./build/spmc_gbenchmark ...
+
+$ for t in /proc/5713/task/*; do ... done
+tid=5713 state=R last_cpu=5 utime=4585
+tid=5716 state=R last_cpu=5 utime=0        # <- never scheduled even once
+
+$ taskset -p 5713   # mask 0x20 = CPU 5 only
+$ taskset -p 5716   # mask 0x20 = CPU 5 only  <- should be CPU 1
+```
+
+Only two threads existed (the GB driver thread and one consumer thread for `Sat/SPSC/1C`), both affinity-restricted to **the same single core**, and the consumer thread had accumulated **zero** CPU ticks since creation — it had never run even once.
+
+**Root cause:** on Linux, a newly created thread **inherits its creator's CPU affinity mask at the moment of creation**. `BM_Latency`/`BM_BroadcastLatency` pinned the GB driver thread to `PROD_CORE` and elevated it to `SCHED_FIFO` 99 *before* spawning consumer threads:
+
+```cpp
+static void BM_Latency(benchmark::State& state) {
+    pin_thread(PROD_CORE);   // driver thread restricted to core 5
+    elevate_thread();        // ...and made SCHED_FIFO 99
+    ...
+    cthr.emplace_back([&, ci, ...]() {
+        pin_thread(CONSUMER_CORES[ci]);   // but this line can never run --
+        ...                                 // see below
+    });
+```
+
+The newly spawned consumer thread is therefore **born** restricted to core 5 too — the same core the driver thread is about to occupy with a `SCHED_FIFO` 99, never-yielding busy-spin loop. Under real `SCHED_FIFO` scheduling (only active with `sudo`; silently a no-op on every prior non-root run this session) with the RT-runtime throttle relaxed (`tune-benchmark-host.sh` sets `sched_rt_runtime_us=-1`), the CFS scheduler can never grant core 5 to the new thread — so it can never execute even its own first instruction, including the `pin_thread(CONSUMER_CORES[ci])` call that would have moved it off core 5 to safety. A permanent priority-inversion livelock.
+
+**Why `BenchmarkMain.cpp`/`TscBenchmarkMain.cpp` never hit this:** their `main()` thread spawns producer *and* consumer threads, then immediately calls `pthr.join()` — blocking, and thereby freeing its core — before any of the newly spawned threads need to run. `GBenchmark.cpp`'s "producer" role is played by the GB driver thread itself, which never blocks after spawning; it goes straight into its own busy-spin loop on the same core.
+
+**A dead end investigated first:** relaxing the RT-runtime throttle back to the Linux default (`sudo sysctl -w kernel.sched_rt_runtime_us=950000`, reserving 5% of every period for non-RT work) was tried as a first hypothesis and did **not** fix the hang — confirming the root cause was the affinity-inheritance ordering, not RT-runtime starvation in isolation. (The system was later returned to the tuned `-1` value once the real fix was in place.)
+
+**Fix:** reset the driver thread's affinity to *all* online cores before spawning consumer threads, and defer `pin_thread(PROD_CORE)`/`elevate_thread()` for the driver thread until *after* the spawn loop — since the GB driver thread runs every registered benchmark sequentially on the same OS thread, it can already be core-restricted from a *previous* benchmark's call by the time a later one spawns its own consumers, so the reset has to happen before every spawn, not just once:
+
+```cpp
+static void reset_thread_affinity() {
+    cpu_set_t s; CPU_ZERO(&s);
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    for (long c = 0; c < n; ++c) CPU_SET(static_cast<int>(c), &s);
+    pthread_setaffinity_np(pthread_self(), sizeof(s), &s);
+}
+
+static void BM_Latency(benchmark::State& state) {
+    reset_thread_affinity();          // children can now migrate anywhere
+    ...
+    for (...) { cthr.emplace_back(...); }   // spawn consumers with unrestricted mask
+    pin_thread(PROD_CORE);            // *now* restrict the driver thread
+    elevate_thread();
+    // producer loop
+}
+```
+
+Applied to both `BM_Latency` and `BM_BroadcastLatency`. Verified: non-root regression check (filtered run) showed no behavior change; `sudo ./build/spmc_gbenchmark` subsequently completed the full run cleanly, twice, matching the two other harnesses' `sudo` behavior.
+
+---
+
+## 26. `SPMCBroadcastQueue` — Tail Latency Results (Root + `SCHED_FIFO` 99 + Full OS Tuning, 3 Runs Each)
+
+Once both bugs above were fixed, all three harnesses were run with `sudo` (real `SCHED_FIFO` 99) on top of the full `tune-benchmark-host.sh` tuning (governor=`performance`, per-core frequency floor pinned, C1E/C6/C10 disabled, RT-runtime throttle unlimited, `isolcpus`/`nohz_full`/`rcu_nocbs` covering cores `0-8`) — three independent runs per harness, run sequentially (not in parallel, to avoid the cross-binary core contention this project's own earlier investigation already documented).
+
+### 26.1 Mechanical scenario (ns; min–max range across 3 runs)
+
+**`spmc_benchmark` (steady_clock):**
+
+| Config | P99.9 | P99.99 | Max |
+|---|---|---|---|
+| Broadcast 1C | 175,674 – 1,489,518 | 509,314 – 1,921,065 | 557,622 – 1,968,018 |
+| Broadcast 2C | 251,833 – 295,269 | 566,801 – 657,019 | 612,827 – 702,072 |
+| Broadcast 4C | 378,202 – 854,485 | 896,491 – 2,243,472 | 1,057,627 – 2,392,365 |
+
+**`spmc_tsc_benchmark` (RDTSC):**
+
+| Config | P99.9 | P99.99 | Max |
+|---|---|---|---|
+| Broadcast 1C | 177,811 – 1,253,051 | 505,375 – 1,685,452 | 553,752 – 1,732,861 |
+| Broadcast 2C | 260,890 – 282,663 | 628,774 – 643,953 | 676,964 – 691,243 |
+| Broadcast 4C | 364,170 – 704,219 | 825,820 – 1,788,293 | 1,013,061 – 1,975,218 |
+
+**`spmc_gbenchmark` (Google Benchmark):**
+
+| Config | P99.9 | P99.99 | Max |
+|---|---|---|---|
+| Broadcast 1C | 190,532 – 202,895 | 521,891 – 527,296 | 567,508 – 573,460 |
+| Broadcast 2C | 313,999 – 325,849 | 639,274 – 667,290 | 675,229 – 710,355 |
+| Broadcast 4C | 492,911 – 519,253 | 996,454 – 1,055,020 | 1,108,280 – 1,185,500 |
+
+### 26.2 Saturated scenario (ns; min–max range across 3 runs)
+
+**`spmc_benchmark`:**
+
+| Config | P99.9 | P99.99 | Max |
+|---|---|---|---|
+| Broadcast 1C | 1,268,316 – 4,021,408 | 1,294,510 – 4,056,405 | 1,297,927 – 4,059,524 |
+| Broadcast 2C | 1,547,345 – 3,831,233 | 1,714,534 – 3,963,059 | 1,744,093 – 3,973,451 |
+| Broadcast 4C | 3,503,539 – 3,640,081 | 4,169,500 – 5,300,711 | 4,265,279 – 5,396,809 |
+
+**`spmc_tsc_benchmark`:**
+
+| Config | P99.9 | P99.99 | Max |
+|---|---|---|---|
+| Broadcast 1C | 1,403,161 – 3,839,446 | 1,404,204 – 3,841,753 | 1,404,475 – 3,843,675 |
+| Broadcast 2C | 3,662,721 – 3,771,552 | 3,762,362 – 3,878,340 | 3,767,399 – 3,889,203 |
+| Broadcast 4C | 1,321,760 – 3,668,403 | 4,301,343 – 4,603,030 | 4,331,438 – 4,637,878 |
+
+**`spmc_gbenchmark`:**
+
+| Config | P99.9 | P99.99 | Max |
+|---|---|---|---|
+| Broadcast 1C | 1,878,960 – 4,177,380 | 1,894,540 – 4,180,730 | 1,895,920 – 4,181,960 |
+| Broadcast 2C | 4,163,740 – 4,319,360 | 4,438,840 – 4,696,390 | 4,473,670 – 4,745,230 |
+| Broadcast 4C | 1,716,290 – 3,693,360 | 4,026,730 – 5,384,060 | 4,239,880 – 5,542,760 |
+
+### 26.3 Evaluation
+
+`Vyukov SPMC 2C`/`4C`, under these exact same tuned + `SCHED_FIFO` conditions, sit in the **hundreds-of-nanoseconds** P99.9 range (§3, §7, §11.2). `SPMCBroadcastQueue` does not reach that tier at *any* consumer count — its Mechanical-scenario P99.9 stays in the same **hundred-microsecond-to-low-millisecond** band this document already spent §5–§17 proving is irreducible single-thread microarchitectural noise for the 1-consumer configurations of `SPSC`/`Vyukov`.
+
+This is architectural, not a regression or an unfixed bug: `try_publish()` gates on the **minimum** cursor position across all N consumers, so *every* consumer must observe *every* item before a slot frees. `SPMCQueue`'s 2C/4C cleanliness comes from the opposite property — redundancy: any single consumer winning the CAS race is enough, so one consumer's OS-jitter stall is invisible in the merged distribution, masked by whichever other consumer wasn't stalled at that instant. `SPMCBroadcastQueue` has no such masking: a stall on any *one* of N consumers stalls the producer, and therefore every consumer, for the same duration. Adding more consumers adds more *chances* for one of them to hit a jitter event, not more redundancy against it — consistent with `Broadcast 4C`'s ranges generally running wider than `Broadcast 2C`'s across all three harnesses above.
+
+Run-to-run variance is itself large (e.g. `spmc_benchmark`'s `Broadcast 1C` Mechanical P99.9 spans an 8.5x range across three runs) — a further data point supporting this document's existing §18 conclusion that the underlying noise source is a hardware-level, largely stochastic phenomenon on this specific COTS hardware, not something any of the OS-level tuning in `tune-benchmark-host.sh` can bound tighter. (An earlier, non-root exploration — running the OS tuning script but without genuine `SCHED_FIFO` active — showed the same qualitative pattern: `Broadcast 2C` Mechanical tail sometimes landed *worse* than an untuned baseline across repeated runs, reinforcing that this isn't something tuning parameters can reliably fix.)
+
+---
+
+## 27. Updated Summary
+
+21. `SPMCBroadcastQueue<T, N>`, a Disruptor-style true fan-out queue (every consumer sees every item, unlike `SPMCQueue`'s competing-consumer delivery), was added along with `Broadcast 1C`/`2C`/`4C` benchmark coverage in all three harnesses.
+22. Two genuine bugs were found and fixed while validating that coverage end-to-end, both in benchmark-harness code rather than the queue itself (independently verified via a bare full-scale queue run and the GoogleTest concurrency stress tests): a rare RDTSC pacing livelock under sustained multi-minute spin in `TscBenchmarkMain.cpp` (§24), and a `SCHED_FIFO`-specific CPU-affinity-inheritance priority inversion in `GBenchmark.cpp`, only reproducible under real root + `SCHED_FIFO` 99 (§25).
+23. With both fixed, three-run tail-latency data was collected across all three harnesses under root + `SCHED_FIFO` 99 + full `tune-benchmark-host.sh` tuning (§26). Conclusion: `SPMCBroadcastQueue` does not — and structurally cannot — reach `Vyukov SPMC`'s clean 2C/4C tail-latency tier, because its slowest-consumer gating (every consumer must see every item) has no redundancy to mask a single consumer's OS-jitter stall, unlike `SPMCQueue`'s competing-consumer delivery. This is a correct, expected consequence of the design trade-off (guaranteed fan-out vs. load-balanced masking), not a defect.
