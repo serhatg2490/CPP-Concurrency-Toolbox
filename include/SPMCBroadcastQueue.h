@@ -197,16 +197,37 @@ public:
     [[nodiscard]] bool try_publish(Args&&... args) {
         const std::size_t tail = tail_.load(std::memory_order_relaxed);
 
-        // Gating: find the slowest consumer's position. N is small and
-        // fixed at compile time, so this is a short, unrollable loop --
-        // no allocation, no locking, just N acquire loads.
-        std::size_t min_cursor = cursors_[0].pos.load(std::memory_order_acquire);
-        for (std::size_t i = 1; i < N; ++i) {
-            const std::size_t c = cursors_[i].pos.load(std::memory_order_acquire);
-            if (c < min_cursor) min_cursor = c;
+        // Gating, with a cached slowest-consumer position.
+        //
+        // The naive version scans all N consumer cursors on EVERY publish.
+        // Those cursors sit on separate cache lines that the consumers are
+        // actively writing, so each scan is N reads of contended lines --
+        // pure overhead on the common path where the ring isn't full.
+        //
+        // Instead keep the last observed minimum and only re-scan when it
+        // says the ring looks full. This is safe because consumer cursors
+        // are monotonically increasing: a stale cached_min_ is therefore
+        // always an UNDER-estimate of the true minimum, so `tail -
+        // cached_min_` is an OVER-estimate of occupancy. It can wrongly
+        // say "full" (costing one extra scan, which then corrects it) but
+        // it can never wrongly say "there is space" -- the direction that
+        // would actually corrupt data.
+        //
+        // The happens-before edge that makes overwriting a slot safe still
+        // comes from a real acquire load: any slot below cached_min_ was
+        // established as fully consumed by the acquire scan that produced
+        // that value.
+        if (tail - cached_min_ >= capacity_) {
+            std::size_t min_cursor = cursors_[0].pos.load(std::memory_order_acquire);
+            for (std::size_t i = 1; i < N; ++i) {
+                const std::size_t c = cursors_[i].pos.load(std::memory_order_acquire);
+                if (c < min_cursor) min_cursor = c;
+            }
+            cached_min_ = min_cursor;
+
+            if (tail - cached_min_ >= capacity_)
+                return false; // full: slowest consumer hasn't vacated this slot
         }
-        if (tail - min_cursor >= capacity_)
-            return false; // full: slowest consumer hasn't vacated this slot
 
         slots_[tail & mask_] = T(std::forward<Args>(args)...);
 
@@ -251,6 +272,12 @@ private:
     std::vector<T>                                          slots_;
 
     alignas(detail_broadcast::cache_line) std::atomic<std::size_t> tail_{0};
+    // Producer-private (never read by consumers), so plain -- not atomic.
+    // Deliberately shares tail_'s cache line: the producer touches both on
+    // every publish, and consumers already pay for that line's invalidation
+    // from the tail_ store, so co-locating costs nothing and saves the
+    // producer a second line.
+    std::size_t             cached_min_{0};
     std::array<Cursor, N>   cursors_;          // each Cursor is independently padded
     std::array<Consumer, N> consumer_handles_; // constructed after cursors_ (declaration order)
 };

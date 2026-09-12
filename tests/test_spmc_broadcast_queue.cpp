@@ -149,6 +149,40 @@ TEST(SPMCBroadcastQueueTest, FullQueueRejectsPublish_UntilSlowestConsumerCatches
     EXPECT_TRUE(q.try_publish(999));
 }
 
+// The producer caches the slowest consumer's position and only re-scans the
+// cursors when that cache says the ring is full. A cache that failed to
+// refresh would wrongly report "full" forever; one that refreshed too
+// eagerly (or tracked the wrong bound) would wrongly report "space" and
+// overwrite an unread slot. Drive many laps, asserting the exact
+// full/not-full transition each time, so both directions are pinned down.
+TEST(SPMCBroadcastQueueTest, CachedGating_RefreshesAcrossManyLaps) {
+    constexpr std::size_t CAPACITY = 8;
+    constexpr int         LAPS     = 100;
+
+    SPMCBroadcastQueue<int, 2> q(CAPACITY);
+
+    int next = 0, expected0 = 0, expected1 = 0;
+    for (int lap = 0; lap < LAPS; ++lap) {
+        for (std::size_t i = 0; i < CAPACITY; ++i)
+            ASSERT_TRUE(q.try_publish(next++)) << "lap " << lap << ", item " << i;
+
+        // Exactly full now -- the cache must not let this through.
+        ASSERT_FALSE(q.try_publish(-1)) << "lap " << lap;
+
+        // Drain both consumers, then the next lap must fit again.
+        for (std::size_t i = 0; i < CAPACITY; ++i) {
+            int v = -1;
+            ASSERT_TRUE(q.consumer(0).try_consume([&](const int& x) { v = x; }));
+            ASSERT_EQ(v, expected0++) << "consumer 0, lap " << lap;
+            ASSERT_TRUE(q.consumer(1).try_consume([&](const int& x) { v = x; }));
+            ASSERT_EQ(v, expected1++) << "consumer 1, lap " << lap;
+        }
+    }
+
+    EXPECT_EQ(expected0, LAPS * static_cast<int>(CAPACITY));
+    EXPECT_EQ(expected1, LAPS * static_cast<int>(CAPACITY));
+}
+
 TEST(SPMCBroadcastQueueTest, IndexWrapAround) {
     constexpr std::size_t CAPACITY = 4;
     constexpr std::size_t TOTAL    = 50; // several full laps around the ring
