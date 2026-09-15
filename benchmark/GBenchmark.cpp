@@ -29,6 +29,7 @@
 
 #include <SPMCBroadcastQueue.h>
 #include <SPMCLockFreeQueue.h>
+#include <SPMCOverwriteQueue.h>
 #include <SPSCLockFreeQueue.h>
 #include "LatencyRecorder.hpp"
 
@@ -374,6 +375,121 @@ static void BM_BroadcastLatency(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
 }
 
+// ── Benchmark 5: Overwrite (lossy fan-out) multi-thread latency ─────────────
+//
+// SPMCOverwriteQueue's publish() never fails, so consumers cannot wait for a
+// fixed item count -- they run until the producer stops and the ring drains.
+// Latency alone would be misleading here (a tiny tail bought by dropping most
+// of the stream is not a win), so Missed and LossPct are reported alongside the
+// percentiles. Consumer count is a runtime Arg, not a template parameter,
+// because the producer never gates on consumers.
+//
+// Parameter layout:  state.range(0) = n_consumers
+//                    state.range(1) = rate_ns  (0 -> saturated, >0 -> mechanical)
+
+template <typename T>
+static void BM_OverwriteLatency(benchmark::State& state) {
+    using Q      = SPMCOverwriteQueue<T>;
+    using Status = typename Q::Status;
+
+    reset_thread_affinity();
+    const auto        n_consumers = static_cast<std::size_t>(state.range(0));
+    const auto        rate_ns     = static_cast<std::int64_t>(state.range(1));
+    const std::size_t warmup      = (rate_ns > 0) ? 100'000UZ : 200'000UZ;
+
+    Q q(4096);
+
+    std::vector<typename Q::Consumer> handles;
+    handles.reserve(n_consumers);
+    for (std::size_t i = 0; i < n_consumers; ++i)
+        handles.push_back(q.make_consumer());
+
+    const std::size_t max_iters = static_cast<std::size_t>(state.max_iterations);
+    std::vector<LatencyRecorder> crecs(n_consumers, LatencyRecorder{max_iters + 10'000});
+    std::vector<std::size_t>     received(n_consumers, 0);
+
+    std::atomic<bool> done{false};
+
+    std::vector<std::thread> cthr;
+    cthr.reserve(n_consumers);
+    for (std::size_t ci = 0; ci < n_consumers; ++ci) {
+        cthr.emplace_back([&, ci, warmup]() {
+            pin_thread(CONSUMER_CORES[ci]);
+            elevate_thread();
+
+            T           item;
+            std::size_t n        = 0;
+            bool        draining = false;
+            for (;;) {
+                const Status st = handles[ci].try_read(item);
+                if (st == Status::Ok) {
+                    if (n >= warmup) {
+                        const std::int64_t lat = now_ns() - item.enqueue_ns;
+                        if (lat >= 0)
+                            crecs[ci].record(static_cast<std::uint64_t>(lat));
+                    }
+                    ++n;
+                    continue;
+                }
+                if (st == Status::Lapped) continue;
+
+                if (draining) break;
+                if (done.load(std::memory_order_acquire)) draining = true;
+            }
+            received[ci] = n;
+        });
+    }
+
+    pin_thread(PROD_CORE);
+    elevate_thread();
+
+    std::int64_t payload = 0;
+    if (rate_ns > 0) {
+        std::int64_t next_ns = now_ns();
+        for (auto _ : state) {
+            std::int64_t ts;
+            do { ts = now_ns(); } while (ts < next_ns);
+            next_ns += rate_ns;
+            q.publish(ts, payload++);
+        }
+    } else {
+        for (auto _ : state)
+            q.publish(now_ns(), payload++);
+    }
+    done.store(true, std::memory_order_release);
+
+    for (auto& t : cthr) t.join();
+
+    std::size_t missed_total = 0, received_total = 0;
+    for (std::size_t ci = 0; ci < n_consumers; ++ci) {
+        missed_total   += handles[ci].missed();
+        received_total += received[ci];
+    }
+
+    LatencyRecorder merged{max_iters * n_consumers + 1'000};
+    for (auto& r : crecs) merged.merge_from(r);
+
+    if (!merged.empty()) {
+        state.counters["Min_ns"]      = static_cast<double>(merged.min_ns());
+        state.counters["Mean_ns"]     = merged.mean_ns();
+        state.counters["P50_ns"]      = static_cast<double>(merged.percentile(50.0));
+        state.counters["P90_ns"]      = static_cast<double>(merged.percentile(90.0));
+        state.counters["P99_ns"]      = static_cast<double>(merged.percentile(99.0));
+        state.counters["P99.9_ns"]    = static_cast<double>(merged.percentile(99.9));
+        state.counters["P99.99_ns"]   = static_cast<double>(merged.percentile(99.99));
+        state.counters["P99.999_ns"]  = static_cast<double>(merged.percentile(99.999));
+        state.counters["Max_ns"]      = static_cast<double>(merged.max_ns());
+        state.counters["Samples"]     = static_cast<double>(merged.count());
+    }
+    state.counters["Missed"]  = static_cast<double>(missed_total);
+    state.counters["LossPct"] =
+        (received_total + missed_total)
+            ? 100.0 * static_cast<double>(missed_total)
+              / static_cast<double>(received_total + missed_total)
+            : 0.0;
+    state.SetItemsProcessed(state.iterations());
+}
+
 // ── Saturated registrations (rate_ns = 0) ────────────────────────────────────
 //  Total iterations = 200K warmup + 2M measure = 2.2M
 //  GB's ns/op -> producer throughput (not latency!)
@@ -404,6 +520,13 @@ BENCHMARK_TEMPLATE(BM_BroadcastLatency, Item, 2)
 BENCHMARK_TEMPLATE(BM_BroadcastLatency, Item, 4)
     ->Name("Sat/Broadcast/4C")->Args({0})->Iterations(SAT_ITERS);
 
+BENCHMARK_TEMPLATE(BM_OverwriteLatency, Item)
+    ->Name("Sat/Overwrite/1C")->Args({1, 0})->Iterations(SAT_ITERS);
+BENCHMARK_TEMPLATE(BM_OverwriteLatency, Item)
+    ->Name("Sat/Overwrite/2C")->Args({2, 0})->Iterations(SAT_ITERS);
+BENCHMARK_TEMPLATE(BM_OverwriteLatency, Item)
+    ->Name("Sat/Overwrite/4C")->Args({4, 0})->Iterations(SAT_ITERS);
+
 // ── Mechanical latency registrations (rate_ns = 500) ─────────────────────────
 //  Total iterations = 100K warmup + 1M measure = 1.1M
 //  GB's ns/op ~= 500 ns (rate limit) — expected, not a latency number
@@ -426,4 +549,11 @@ BENCHMARK_TEMPLATE(BM_BroadcastLatency, Item, 2)
     ->Name("Mech/Broadcast/2C")->Args({RATE_NS})->Iterations(MECH_ITERS);
 BENCHMARK_TEMPLATE(BM_BroadcastLatency, Item, 4)
     ->Name("Mech/Broadcast/4C")->Args({RATE_NS})->Iterations(MECH_ITERS);
+
+BENCHMARK_TEMPLATE(BM_OverwriteLatency, Item)
+    ->Name("Mech/Overwrite/1C")->Args({1, RATE_NS})->Iterations(MECH_ITERS);
+BENCHMARK_TEMPLATE(BM_OverwriteLatency, Item)
+    ->Name("Mech/Overwrite/2C")->Args({2, RATE_NS})->Iterations(MECH_ITERS);
+BENCHMARK_TEMPLATE(BM_OverwriteLatency, Item)
+    ->Name("Mech/Overwrite/4C")->Args({4, RATE_NS})->Iterations(MECH_ITERS);
 // clang-format on

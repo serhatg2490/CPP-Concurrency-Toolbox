@@ -12,12 +12,19 @@ Just add `include/` to your include path — no linking, no runtime dependencies
 |---|---|---|
 | `SPSCQueue<T>` | `SPSCLockFreeQueue.h` | One producer → one consumer. The fastest handoff; no CAS at all. |
 | `SPMCQueue<T>` | `SPMCLockFreeQueue.h` | One producer → a pool of interchangeable workers. Each item goes to **exactly one** consumer (load balancing). |
-| `SPMCBroadcastQueue<T, N>` | `SPMCBroadcastQueue.h` | One producer → N independent subscribers. **Every** consumer sees **every** item (fan-out). |
+| `SPMCBroadcastQueue<T, N>` | `SPMCBroadcastQueue.h` | One producer → N independent subscribers. **Every** consumer sees **every** item (fan-out), guaranteed. |
+| `SPMCOverwriteQueue<T>` | `SPMCOverwriteQueue.h` | Same fan-out, but **lossy**: the producer never waits. A consumer that falls behind loses old items and is told exactly how many. |
 | `ThreadPool` | `ThreadPool.h` | General task offload. Mutex-based, not for the latency-critical path. |
 
-**Choosing between `SPMCQueue` and `SPMCBroadcastQueue`:** if your consumers are interchangeable workers sharing one job, use `SPMCQueue`. If they're different systems that each need the same data (e.g. strategy engine + risk engine + journaling), use `SPMCBroadcastQueue`.
+**Which fan-out queue?**
 
-All three queues are **single-producer only** — a second concurrent producer is undefined behavior.
+- Consumers are interchangeable workers sharing one job → `SPMCQueue` (each item goes to one of them).
+- Every consumer needs every item and **none may be lost** (journaling, order flow) → `SPMCBroadcastQueue`.
+- Every consumer needs the **latest** data and stale data is worthless (market feeds, telemetry) → `SPMCOverwriteQueue`.
+
+The last one matters only under **sustained overload** — when a consumer simply cannot keep up with the producer. For transient stalls it gains you nothing (see §Benchmarks).
+
+All four queues are **single-producer only** — a second concurrent producer is undefined behavior.
 
 ---
 
@@ -88,6 +95,39 @@ if (auto t = c.try_copy()) {           // or copy it out
 
 Also provides `capacity()`, `backlog_approx()`, and `Consumer::position()`.
 
+### `SPMCOverwriteQueue<T>`
+
+Consumer count is **not** a template parameter — the producer never waits on consumers, so it doesn't need to know how many there are. Consumers can join at runtime.
+
+```cpp
+#include <SPMCOverwriteQueue.h>
+
+SPMCOverwriteQueue<Tick> q(64);        // see the capacity note below
+using Status = SPMCOverwriteQueue<Tick>::Status;
+
+// Producer — no failure mode at all, never blocks
+q.publish(symbol, price);
+
+// Consumer thread (one per handle; a new handle starts from "now")
+auto c = q.make_consumer();
+Tick out;
+switch (c.try_read(out)) {
+    case Status::Ok:     process(out);        break;
+    case Status::Empty:                       break;   // nothing new yet
+    case Status::Lapped: log_gap(c.missed()); break;   // fell behind; call again
+}
+```
+
+`T` must be **trivially copyable** and default-constructible — the payload moves under a seqlock via `memcpy`, so reads cannot be zero-copy here.
+
+**Capacity means something different in this queue.** Elsewhere it's "how much can I buffer" and bigger is better. Here it is a **staleness budget**:
+
+```
+worst-case age of the data you read  ≈  capacity × publish interval
+```
+
+Pick it from how stale you can tolerate your data being, not from throughput. A 500 ns stream with a 10 µs tolerance wants a capacity around 16-20 — and note that the time span shrinks during bursts, exactly when you are most likely to fall behind.
+
 ### `ThreadPool`
 
 ```cpp
@@ -134,9 +174,9 @@ cmake --build build --config Release -j"$(nproc)"
 ctest --test-dir build --output-on-failure -LE benchmark   # unit tests only
 ```
 
-This produces four test binaries and three benchmark binaries (`spmc_benchmark`, `spmc_tsc_benchmark`, `spmc_gbenchmark`). All are registered with CTest; the benchmarks carry a `benchmark` label so you can filter them in or out.
+This produces five test binaries and three benchmark binaries (`spmc_benchmark`, `spmc_tsc_benchmark`, `spmc_gbenchmark`). All are registered with CTest; the benchmarks carry a `benchmark` label so you can filter them in or out.
 
-Current status: **63 unit tests, all passing** (~8s).
+Current status: **76 unit tests, all passing** (~8s).
 
 ---
 
@@ -184,19 +224,20 @@ sudo ./scripts/tune-benchmark-host.sh --undo
 
 Reference machine: Intel Core Ultra 5 125H (Meteor Lake hybrid), Ubuntu / Linux 7.0.0, fully tuned, root + `SCHED_FIFO` 99.
 
-Mechanical scenario, TSC clock, nanoseconds:
+Mechanical scenario, `steady_clock`, nanoseconds, median of 3 runs:
 
 | Queue | P50 | P99 | P99.9 | Max |
 |---|---|---|---|---|
-| SPSC 1 consumer | 208 | 244 | 183,353 | 569,459 |
-| SPMC 1 consumer | 210 | 227 | 245,490 | 636,052 |
-| **SPMC 2 consumers** | 210 | 289 | **334** | **2,666** |
-| **SPMC 4 consumers** | 201 | 316 | **382** | **11,013** |
-| Broadcast 1 consumer | 162 – 172 | 190 – 710 | 177,811 – 1,253,051 | 553,752 – 1,732,861 |
-| Broadcast 2 consumers | 156 – 169 | 215 – 234 | 260,890 – 282,663 | 676,964 – 691,243 |
-| Broadcast 4 consumers | 180 – 193 | 215 – 228 | 364,170 – 704,219 | 1,013,061 – 1,975,218 |
-
-SPSC/SPMC rows are one representative run. Broadcast rows are min–max ranges across three runs — run-to-run variance is large enough that any single run would be misleading.
+| SPSC 1 consumer | 246 | 293 | 185,975 | 569,449 |
+| SPMC 1 consumer | 204 | 258 | 237,347 | 630,356 |
+| **SPMC 2 consumers** | 277 | 396 | **479** | **4,456** |
+| **SPMC 4 consumers** | 256 | 468 | **549** | **2,302** |
+| Broadcast 1 consumer | 168 | 196 | 1,425,260 | 1,905,485 |
+| Broadcast 2 consumers | 159 | 206 | 291,812 | 697,313 |
+| Broadcast 4 consumers | 170 | 226 | 441,499 | 1,101,658 |
+| Overwrite 1 consumer | 128 | 141 | 180,428 | 564,321 |
+| Overwrite 2 consumers | 137 | 185 | 287,553 | 691,672 |
+| Overwrite 4 consumers | 201 | 390 | 448,278 | 1,174,219 |
 
 **What this means:**
 
@@ -204,17 +245,40 @@ SPSC/SPMC rows are one representative run. Broadcast rows are min–max ranges a
 - **`SPMCQueue` with 2+ consumers is the strongest configuration** — sub-microsecond P99.9, single-digit-microsecond max. This is the one to reach for if tail latency matters.
 - **Single-consumer configurations show a P99.9 cliff** (~200 ns jumping to 150-250 µs). This repo's investigation tested and eliminated 11 separate hypotheses for it — core pinning, C-states, IRQ/timer ticks, HT contention, RT throttling, thermal throttling, and more. Both SPSC and SPMC show the same magnitude despite being unrelated algorithms, which points at irreducible hardware noise rather than a queue bug. With 2+ consumers it disappears, because another consumer picks up the slack when one stalls.
 - **`SPMCBroadcastQueue` keeps that tail at every consumer count**, by design: every consumer must see every item before a slot frees, so one stalled consumer stalls all of them. There's no redundancy to mask jitter — more consumers means more chances to hit it, not fewer.
+- **`SPMCOverwriteQueue` matches it here, and that is expected.** At capacity 4096 nothing is ever overwritten in this scenario (measured loss: 0.0%), so it behaves exactly like a lossless queue. Its mechanism only engages under overload — see below.
 
-Full measurement trail, per-harness data, and the Saturated numbers: [`docs/benchmark-analysis-2026-07-22.md`](docs/benchmark-analysis-2026-07-22.md).
+### When the lossy queue actually helps
+
+Under backpressure the two fan-out queues diverge sharply. Saturated scenario, median of 3 runs:
+
+| Queue | Max | Loss |
+|---|---|---|
+| Broadcast 1 consumer | 3.49 ms | 0% |
+| **Overwrite 1 consumer** | **70 µs** | 7.3% |
+| Broadcast 4 consumers | 4.53 ms | 0% |
+| **Overwrite 4 consumers** | **281 µs** | 75.5% |
+
+But **per-item latency flatters the lossy queue**: it is only recorded for items that were actually delivered, and the slow ones are exactly the ones discarded. A fairer metric is *how stale is the consumer's view of the world*, sampled on a wall clock rather than per delivery. Measured that way:
+
+| Situation | Does the lossy queue help? |
+|---|---|
+| Consumer keeps up | **No** — nothing is overwritten, loss 0% |
+| Transient stall (OS jitter), fast consumer | **No** — measured identical to Broadcast (~199 µs either way) |
+| **Sustained overload, consumer can't keep up** | **Yes** — view staleness 3.41 ms → 8.1 µs |
+
+So this is an **overload** tool, not a jitter tool. Note that in overload the lossless queue loses data too — its producer simply cannot publish (39.5% dropped at the input in that measurement). The difference is *which* data you lose: the lossless queue drops the newest, the lossy one drops the oldest.
+
+Full measurement trail, per-harness data and the Saturated numbers: [`docs/benchmark-analysis-2026-07-22.md`](docs/benchmark-analysis-2026-07-22.md).
 
 ---
 
 ## Limitations
 
-- **Single producer only** for all three queues — concurrent producers are undefined behavior. `SPSCQueue` is additionally single-*consumer* only.
+- **Single producer only** for all four queues — concurrent producers are undefined behavior. `SPSCQueue` is additionally single-*consumer* only.
 - **Fixed capacity**, power-of-two, set at construction. No resizing.
 - **`SPMCBroadcastQueue`'s `N` is compile-time** and its throughput is capped by the slowest consumer. It is not a drop-in `SPMCQueue` replacement — different problem, different tail-latency profile.
-- **Don't assume a tight P99.9 bound** for single-consumer setups, or for `SPMCBroadcastQueue` at any consumer count, without measuring on your own hardware.
+- **`SPMCOverwriteQueue` loses data by design** and only pays off under sustained overload. `T` must be trivially copyable, reads are never zero-copy, and its capacity is a staleness budget rather than a buffer size. Its seqlock carries the usual formal caveat: the reader copies the payload while the writer may be rewriting it and validates afterwards — a data race by the letter of the memory model, as in every production seqlock.
+- **Don't assume a tight P99.9 bound** for single-consumer setups, or for either fan-out queue, without measuring on your own hardware.
 - **Benchmark core-pinning constants are machine-specific** and must be re-derived for your CPU.
 - **TSC timing is x86-only** and assumes a single socket.
 - **`ThreadPool` is mutex-based** — fine for coarse-grained work, not for the sub-microsecond path.

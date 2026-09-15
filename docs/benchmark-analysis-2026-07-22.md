@@ -620,8 +620,210 @@ Run-to-run variance is itself large (e.g. `spmc_benchmark`'s `Broadcast 1C` Mech
 
 ---
 
-## 27. Updated Summary
+## 27. Cached Gating in `SPMCBroadcastQueue` (A1)
+
+`try_publish()` originally scanned all N consumer cursors on **every** publish — N acquire loads from cache lines the consumers are actively writing. The producer now caches the last observed minimum and re-scans only when that cache says the ring looks full:
+
+```cpp
+if (tail - cached_min_ >= capacity_) {
+    /* ...scan all N cursors, update cached_min_... */
+    if (tail - cached_min_ >= capacity_) return false;
+}
+```
+
+**Why this is safe:** consumer cursors only ever increase, so a stale `cached_min_` is always an *under*-estimate of the true minimum, making `tail - cached_min_` an *over*-estimate of occupancy. It can wrongly say "full" (costing one extra scan that then corrects it) but never wrongly say "there is space" — the direction that would corrupt data. The happens-before edge that makes overwriting a slot safe still comes from a real acquire load: any slot below `cached_min_` was established as consumed by the acquire scan that produced that value.
+
+**Measured effect.** The fast path hits **99.8-100%** of the time (300,000 publishes → 73 scans), and publish throughput rises accordingly:
+
+| | publish/s |
+|---|---|
+| Without cache | 43-47 M |
+| With cache | **188-212 M** |
+
+**But the gain is conditional on thread pinning**, which was not obvious and is worth recording:
+
+| | Cache on | Cache off |
+|---|---|---|
+| Threads unpinned | 0.041 s | 0.042 s (**no difference**) |
+| Threads pinned to separate P-cores | **0.010 s** | 0.043 s (**~4.2x**) |
+
+Without pinning the scheduler places threads such that the cursor lines do not ping-pong consistently between distinct physical cores, and the effect disappears. Pinning alone is the larger win; the cache only pays off once you have it.
+
+### 27.1 The gain is invisible in this repo's own benchmarks
+
+Neither standard scenario shows it, because in both the **producer is not the bottleneck**:
+
+| Scenario | Cache on | Cache off |
+|---|---|---|
+| Mechanical (rate-limited 500 ns) | 0.150 s | 0.150 s |
+| Free-running, consumers keep up | 0.097 s | 0.163 s |
+
+In the Mechanical scenario the producer already spends ~500 ns per item spinning on the clock; the ~20-100 ns gating scan is *absorbed* by the rate limiter, which simply spins less. In the Saturated scenario the bottleneck is consumer drain rate. An initial guess that "the cache must not be hitting" was **wrong** — instrumented counters showed the fast path hitting ~100% in every scenario.
+
+### 27.2 `cache-misses` is the wrong counter for this
+
+Measuring with `perf stat -e cache-misses` shows nothing useful, and briefly suggested the *opposite* conclusion:
+
+| Metric | What it measures | Cache on | Cache off | Real? |
+|---|---|---|---|---|
+| cache-references | requests reaching LLC | 9.96 M | 19.74 M | ✅ 2x |
+| Load LLC hit | loads served by LLC (sampled) | 784 | 2,125 | ✅ 2.7x |
+| **Load Local HITM** | **LLC hit, line modified in another core** | **171** | **1,348** | ✅ **7.9x** |
+| cache-misses | LLC miss → DRAM | 68 K ±43% | 49 K ±23% | ❌ noise |
+
+On this machine `cache-misses` is `event=0x2e,umask=0x41` — LLC *misses*, i.e. traffic to DRAM. The cursor lines never reach DRAM: the working set is ~64 KB (4096 slots × 16 B) against an 18 MB L3. The contention is core-to-core, which only **HITM** captures. The apparent "improvement" in `cache-misses` is inside its own ±43% error bars.
+
+The expected extra LLC traffic also checks out: 4 cursor loads × 2 M publishes = 8.0 M, against a measured increase of 9.8 M.
+
+### 27.3 A refuted explanation, recorded
+
+It was initially argued that the producer's repeated cursor reads slow the *consumers* down by forcing them to re-acquire ownership (RFO) on every cursor store. Directly measured, this is **false** — a remote reader does not measurably slow a writer, at any store spacing:
+
+| work between stores | no reader | with remote reader | slowdown |
+|---|---|---|---|
+| 0 | 2015 M store/s | 2910 M store/s | 0.69x |
+| 20 | 30.5 M store/s | 30.6 M store/s | 1.00x |
+| 100 | 6.2 M store/s | 6.3 M store/s | 0.98x |
+
+Stores retire into the store buffer, so RFO latency is hidden; loads are synchronous and must wait, which is why HITM *reads* cost measurable time and RFO *writes* do not. (A separate observation — that the queue reports "full" 39,244 times with the cache off versus 0 with it on — remains unexplained and is left on record rather than attached to a mechanism that measurement refuted.)
+
+---
+
+## 28. `SPMCOverwriteQueue<T>` — A Lossy Fan-Out Alternative
+
+`SPMCBroadcastQueue` gates every publish on the **slowest** consumer, so one stalled consumer stalls the producer and therefore every other consumer. `SPMCOverwriteQueue` takes the opposite trade: `publish()` always succeeds and overwrites whatever has not been read yet. A consumer that falls more than `capacity` items behind detects it precisely and is told exactly how many items it missed.
+
+**File:** `include/SPMCOverwriteQueue.h`
+
+Design consequences of not gating on consumers:
+- The producer does not need to know how many consumers exist, so **N is not a template parameter**; consumers can be created at runtime.
+- The write position is producer-private and need not be atomic.
+- **Reads cannot be zero-copy** — the slot can be overwritten at any instant, so the payload must be copied out before it is safe to hand over. Hence `T` is restricted to trivially copyable types.
+
+Slot protocol is a standard seqlock: `seq == (pos << 1)` means the slot stably holds that position, `(pos << 1) | 1` means the producer is mid-write. Positions are 1-based so a zeroed slot (`seq == 0`) reads as "holds position 0", which never occurs, rather than being mistaken for real data.
+
+**Formal caveat**, recorded honestly: the reader `memcpy`s the payload while the writer may be writing it and only afterwards checks whether the read was torn. That concurrent access is a data race by the letter of the C++ memory model. This is the same trade every production seqlock makes (the Linux kernel's and Folly's among them).
+
+### 28.1 ThreadSanitizer cannot validate this queue
+
+Four separate mutations to the seqlock were injected and TSan reported **nothing** for all four: removing the in-progress flag check, removing the lap pre-check, downgrading the consumer's acquire load to relaxed, and removing both producer release fences. A control experiment explains why:
+
+```
+plain scalar race, no synchronization  -> TSan CATCHES it
+plain memcpy race, no synchronization  -> TSan SILENT
+```
+
+GCC 13's TSan does not instrument `memcpy` for race detection. Since `SPMCOverwriteQueue`'s entire payload path is `memcpy`, TSan is structurally blind to it. (Clang's TSan may differ; clang is not installed on this machine, so no claim is made.) The seqlock logic is therefore validated by mutation testing against the normal GoogleTest suite instead — removing the torn-read check, the in-progress flag, or the `missed()` accounting each makes tests fail.
+
+TSan *does* work on the atomic/scalar paths: making `published_` non-atomic is caught immediately and pinpointed to `Consumer::lapped_to()`.
+
+---
+
+## 29. Capacity Is a Staleness Budget, Not a Buffer Size
+
+The benchmark registrations use capacity 4096 for comparability with the other queues. In the Mechanical scenario that produces **0.0% loss** — the overwrite mechanism never engages at all, and the queue simply behaves like a lossless one and inherits its tail. Shrinking capacity changes this completely:
+
+| Capacity | Fill time | P99.9 | Max | Loss |
+|---|---|---|---|---|
+| 4096 | 2.05 ms | 101 µs | 332 µs | 0.00% |
+| 256 | 0.13 ms | 47 µs | 107 µs | 0.00% |
+| 64 | 0.03 ms | 2.6 µs | 32 µs | 0.15% |
+| **16** | 0.01 ms | **267 ns** | **8.4 µs** | **0.16%** |
+
+A **380x** P99.9 improvement for 0.16% loss. Loss begins exactly where the ring's time span drops below typical stall durations.
+
+This yields a predictive law, confirmed across six capacities:
+
+```
+max observed latency  ≈  capacity × publish interval
+```
+
+| Capacity | `capacity × 500 ns` | Measured Max | Per slot |
+|---|---|---|---|
+| 4 | 2.0 µs | 2.09 µs | 521 ns |
+| 8 | 4.0 µs | 4.42 µs | 553 ns |
+| 16 | 8.0 µs | 8.13 µs | 508 ns |
+| 32 | 16.0 µs | 16.15 µs | 505 ns |
+| 64 | 32.0 µs | 41.5 µs | 649 ns |
+| 128 | 64.0 µs | 63.93 µs | 499 ns |
+
+So in this queue capacity should be chosen from **how stale the data may be**, not from throughput. Note the time span is rate-dependent: 20 slots is 10 µs at 500 ns/item but only 2 µs during a 100 ns/item burst — precisely when falling behind is most likely.
+
+### 29.1 Why more consumers means higher latency here
+
+Unlike `SPMCBroadcastQueue`, this queue's producer never reads consumer cursors, so the gating cost does not exist. The latency still grows with consumer count, for a different reason — the producer itself slows down:
+
+```
+N=1 | producer 25.9 M/s ( 38.7 ns/item) | consumer 25.6 M/s
+N=2 | producer 15.9 M/s ( 62.8 ns/item) | consumer 15.9 / 15.9 M/s
+N=4 | producer  9.4 M/s (105.9 ns/item) | consumer 9.4 / 9.4 / 9.4 / 9.3 M/s
+```
+
+The producer sweeps sequentially through 4096 distinct slots, so every write is a fresh ownership acquisition against however many consumer copies exist. More consumers means more invalidations per write. Combined with the law above — staleness ≈ capacity × publish interval — a slower publish directly widens the ring's time span:
+
+| | publish interval | ratio | Mean latency (median) | ratio |
+|---|---|---|---|---|
+| 1C | 38.7 ns | 1.0x | 24.0 µs | 1.0x |
+| 2C | 62.8 ns | 1.6x | 36.2 µs | 1.5x |
+| 4C | 105.9 ns | 2.7x | 48.8 µs | 2.0x |
+
+This does not contradict §27.3's finding that a remote reader doesn't slow a writer: there the writer rewrote a *single* line that stayed in `M` state, whereas here it sweeps thousands of distinct lines and never gets to keep one.
+
+---
+
+## 30. Per-Item Latency Is the Wrong Metric for a Lossy Queue
+
+The 380x improvement in §29 comes entirely from **high-latency samples never being recorded** — they were overwritten before they could be read. This is survivorship bias: the measurement is conditioned on delivery, and the conditioning correlates with the quantity being measured. (A close cousin of Coordinated Omission, with one difference: there the omission is an accident of the harness that hides a real problem, whereas here it is the system's actual behavior — the consumer genuinely never sees those items.)
+
+A bias-free metric is **how stale is the consumer's view of the world**, sampled on a wall clock every 5 µs rather than per delivery. Measured that way, the picture changes substantially.
+
+**Consumer keeps up** — no difference, and none expected (loss 0.00% everywhere):
+
+| | P50 | Max |
+|---|---|---|
+| Broadcast (4096) | 373 ns | 54.9 µs |
+| Overwrite (16) | 506 ns | 68.0 µs |
+
+**Transient 200 µs stall injected into the consumer** — still no difference:
+
+| | P99 | Max | Loss |
+|---|---|---|---|
+| Broadcast (4096) | 97.5 µs | 197.5 µs | 0.00% |
+| Overwrite (4096) | 98.4 µs | 198.4 µs | 0.00% |
+| Overwrite (64) | 97.5 µs | 200.0 µs | 1.64% |
+| Overwrite (16) | 97.9 µs | 199.9 µs | 1.87% |
+
+During the stall the consumer is not reading at all, so its view is frozen regardless of what the queue does. On waking, the lossless queue drains a 400-item backlog in ~12 µs while the lossy one jumps straight to fresh data — but against a 200 µs stall neither shows in the percentiles.
+
+**Sustained overload** (consumer permanently slower than the producer; realistic feed-handler model where data is generated at a fixed rate and dropped if it cannot be published) — here the difference is real and large:
+
+| | View age (P50) | Loss |
+|---|---|---|
+| Broadcast (4096) | **3.41 ms** | 39.5% (dropped at input) |
+| Overwrite (4096) | 2.05 ms | 47.1% |
+| Overwrite (256) | 128 µs | 48.9% |
+| **Overwrite (16)** | **8.1 µs** | 50.4% |
+
+**420x**, under a metric immune to survivorship bias.
+
+Two things worth noting. First, the lossless queue **also loses data under overload** — its producer simply cannot publish (39.5% dropped at the input). Total loss is comparable (39.5% vs 50.4%); the difference is *which* data is discarded: the lossless queue drops the newest, the lossy one drops the oldest. Second, this places the queue precisely:
+
+| Situation | Does `SPMCOverwriteQueue` help? |
+|---|---|
+| Consumer keeps up | No — mechanism never engages |
+| Transient stall (OS jitter), fast consumer | No — measured identical |
+| **Sustained overload** | **Yes** — 3.41 ms → 8.1 µs view staleness |
+
+It is an **overload** tool, not a jitter tool. That the Saturated benchmark scenario flatters it is not a coincidence: Saturated *is* the sustained-overload case.
+
+---
+
+## 31. Updated Summary
 
 21. `SPMCBroadcastQueue<T, N>`, a Disruptor-style true fan-out queue (every consumer sees every item, unlike `SPMCQueue`'s competing-consumer delivery), was added along with `Broadcast 1C`/`2C`/`4C` benchmark coverage in all three harnesses.
 22. Two genuine bugs were found and fixed while validating that coverage end-to-end, both in benchmark-harness code rather than the queue itself (independently verified via a bare full-scale queue run and the GoogleTest concurrency stress tests): a rare RDTSC pacing livelock under sustained multi-minute spin in `TscBenchmarkMain.cpp` (§24), and a `SCHED_FIFO`-specific CPU-affinity-inheritance priority inversion in `GBenchmark.cpp`, only reproducible under real root + `SCHED_FIFO` 99 (§25).
 23. With both fixed, three-run tail-latency data was collected across all three harnesses under root + `SCHED_FIFO` 99 + full `tune-benchmark-host.sh` tuning (§26). Conclusion: `SPMCBroadcastQueue` does not — and structurally cannot — reach `Vyukov SPMC`'s clean 2C/4C tail-latency tier, because its slowest-consumer gating (every consumer must see every item) has no redundancy to mask a single consumer's OS-jitter stall, unlike `SPMCQueue`'s competing-consumer delivery. This is a correct, expected consequence of the design trade-off (guaranteed fan-out vs. load-balanced masking), not a defect.
+24. `try_publish()` was optimised to cache the slowest-consumer position instead of scanning all N cursors on every publish (§27). Throughput rose ~4.4x — but only with threads pinned to separate physical cores, and the gain is invisible in both standard benchmark scenarios because the producer is not the bottleneck in either. Along the way: `cache-misses` was shown to be the wrong counter for cross-core contention (HITM is the right one, 171 → 1,348), and one proposed mechanism ("the producer's reads slow the consumers' stores via RFO") was directly measured and **refuted**.
+25. `SPMCOverwriteQueue<T>`, a lossy seqlock-based fan-out queue whose producer never waits, was added with tests and benchmark coverage in all three harnesses (§28). ThreadSanitizer was found to be structurally unable to validate it — GCC 13's TSan does not instrument `memcpy`, which is this queue's entire payload path — so its correctness rests on mutation testing against the normal test suite instead.
+26. Capacity in that queue was established to be a **staleness budget** rather than a buffer size, obeying `max latency ≈ capacity × publish interval` across six measured capacities (§29). At the benchmark's 4096 the mechanism never engages at all (0.0% loss); at 16 the P99.9 is 380x lower for 0.16% loss.
+27. Most importantly (§30): the per-item latency improvement is **survivorship bias** — the slow samples are exactly the ones discarded. Re-measured with a wall-clock-sampled "how stale is the consumer's view" metric, the lossy queue gives **no benefit** when the consumer keeps up or during transient jitter, and a **420x** benefit only under sustained overload (view staleness 3.41 ms → 8.1 µs). It is an overload tool, not a jitter tool. Under overload the lossless queue loses comparable amounts of data anyway (39.5% dropped at its input); the real difference is that it discards the *newest* data while the lossy queue discards the *oldest*.

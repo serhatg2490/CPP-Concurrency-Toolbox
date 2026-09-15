@@ -15,6 +15,7 @@
 
 #include <SPMCBroadcastQueue.h>
 #include <SPMCLockFreeQueue.h>
+#include <SPMCOverwriteQueue.h>
 #include <SPSCLockFreeQueue.h>
 #include "LatencyRecorder.hpp"
 #include "TscClock.hpp"
@@ -254,6 +255,118 @@ void run_broadcast_benchmark(const char*  label,
     merged.print_report(label);
 }
 
+// ── Overwrite (lossy fan-out) benchmark function ──────────────────────────────
+//
+// See BenchmarkMain.cpp for the rationale. In short: publish() never fails, so
+// consumers cannot wait for a fixed item count and the loss rate is folded into
+// the printed label -- a small tail bought by dropping most of the stream would
+// otherwise read as a win. The consumer count is a runtime argument because the
+// producer never gates on consumers.
+template <typename T>
+void run_overwrite_benchmark(const char*  name,
+                             std::size_t  n_consumers,
+                             std::size_t  warmup,
+                             std::size_t  measure,
+                             std::size_t  capacity,
+                             std::int64_t rate_limit_ns   = 0,
+                             int          producer_core   = PROD_CORE,
+                             const int*   consumer_cores  = CONSUMER_CORES)
+{
+    using Q      = SPMCOverwriteQueue<T>;
+    using Status = typename Q::Status;
+
+    const std::size_t total = warmup + measure;
+    Q q(capacity);
+
+    std::vector<typename Q::Consumer> handles;
+    handles.reserve(n_consumers);
+    for (std::size_t i = 0; i < n_consumers; ++i)
+        handles.push_back(q.make_consumer());
+
+    std::vector<LatencyRecorder> recs(n_consumers, LatencyRecorder{measure + 10'000});
+    std::vector<std::size_t>     received(n_consumers, 0);
+    std::atomic<bool>            go{false};
+    std::atomic<bool>            done{false};
+
+    std::vector<std::thread> cthr;
+    cthr.reserve(n_consumers);
+    for (std::size_t ci = 0; ci < n_consumers; ++ci) {
+        cthr.emplace_back([&, ci, warmup, consumer_cores]() {
+            pin_thread(consumer_cores ? consumer_cores[ci] : -1);
+            elevate_thread();
+            while (!go.load(std::memory_order_acquire)) {}
+
+            T           item;
+            std::size_t n        = 0;
+            bool        draining = false;
+            for (;;) {
+                const Status st = handles[ci].try_read(item);
+                if (st == Status::Ok) {
+                    const std::int64_t now = consume_ts();
+                    if (n >= warmup) {
+                        const std::int64_t lat = now - item.enqueue_ns;
+                        if (lat >= 0)
+                            recs[ci].record(static_cast<std::uint64_t>(lat));
+                    }
+                    ++n;
+                    continue;
+                }
+                if (st == Status::Lapped) continue;
+
+                if (draining) break;
+                if (done.load(std::memory_order_acquire)) draining = true;
+            }
+            received[ci] = n;
+        });
+    }
+
+    std::thread pthr([&, rate_limit_ns, total]() {
+        pin_thread(producer_core);
+        elevate_thread();
+        while (!go.load(std::memory_order_acquire)) {}
+
+        if (rate_limit_ns > 0) {
+            std::int64_t next_ns = static_cast<std::int64_t>(tsc::epoch_ns(tsc::now()));
+            for (std::size_t i = 0; i < total; ++i) {
+                std::int64_t ts;
+                // Same bounded spin as run_broadcast_benchmark -- see the
+                // comment there for why an unbounded RDTSC wait can strand.
+                std::uint64_t spins = 0;
+                do { ts = produce_ts(); } while (ts < next_ns && ++spins < 1'000'000ULL);
+                if (ts < next_ns) next_ns = ts;
+                next_ns += rate_limit_ns;
+                q.publish(ts, static_cast<std::int64_t>(i));
+            }
+        } else {
+            for (std::size_t i = 0; i < total; ++i)
+                q.publish(produce_ts(), static_cast<std::int64_t>(i));
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    go.store(true, std::memory_order_release);
+    pthr.join();
+    for (auto& t : cthr) t.join();
+
+    std::size_t missed_total = 0, received_total = 0;
+    for (std::size_t ci = 0; ci < n_consumers; ++ci) {
+        missed_total   += handles[ci].missed();
+        received_total += received[ci];
+    }
+    const double loss_pct =
+        (received_total + missed_total)
+            ? 100.0 * static_cast<double>(missed_total)
+              / static_cast<double>(received_total + missed_total)
+            : 0.0;
+
+    char lbl[64];
+    std::snprintf(lbl, sizeof(lbl), "%s (loss %.1f%%)", name, loss_pct);
+
+    LatencyRecorder merged{measure * n_consumers + 10'000};
+    for (auto& r : recs) merged.merge_from(r);
+    merged.print_report(lbl);
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 int main() {
     tsc::calibrate(std::chrono::milliseconds{20});
@@ -293,6 +406,9 @@ int main() {
         run_broadcast_benchmark<Item, 1>    ("Broadcast   1C", W, M, C);
         run_broadcast_benchmark<Item, 2>    ("Broadcast   2C", W, M, C);
         run_broadcast_benchmark<Item, 4>    ("Broadcast   4C", W, M, C);
+        run_overwrite_benchmark<Item>       ("Overwrite   1C", 1, W, M, C);
+        run_overwrite_benchmark<Item>       ("Overwrite   2C", 2, W, M, C);
+        run_overwrite_benchmark<Item>       ("Overwrite   4C", 4, W, M, C);
     }
 
     {
@@ -317,6 +433,9 @@ int main() {
         run_broadcast_benchmark<Item, 1>    ("Broadcast   1C", W, M, C, RATE_NS);
         run_broadcast_benchmark<Item, 2>    ("Broadcast   2C", W, M, C, RATE_NS);
         run_broadcast_benchmark<Item, 4>    ("Broadcast   4C", W, M, C, RATE_NS);
+        run_overwrite_benchmark<Item>       ("Overwrite   1C", 1, W, M, C, RATE_NS);
+        run_overwrite_benchmark<Item>       ("Overwrite   2C", 2, W, M, C, RATE_NS);
+        run_overwrite_benchmark<Item>       ("Overwrite   4C", 4, W, M, C, RATE_NS);
     }
 
     std::printf("\n  All values are in nanoseconds (ns).\n");
